@@ -179,7 +179,12 @@ def prepare_playback(config, token, user_id, item, audio_index=None, subtitle_in
     url = config["serverUrl"].rstrip("/") + "/Videos/" + item_id + "/stream?static=true&ApiKey=" + token
     play_method = "DirectPlay"
     media_source_id = item.get("MediaSourceId")
+    is_audio = item.get("Type") == "Audio"
+    if is_audio:
+        # mpv decodes music directly; no video transcoding profile is needed.
+        url = config["serverUrl"].rstrip("/") + "/Audio/" + item_id + "/stream?static=true&ApiKey=" + token
     try:
+        if is_audio: raise StopIteration
         profile = {"Name": "RG35XX H", "MaxStreamingBitrate": max_bitrate, "MaxStaticBitrate": max_bitrate,
                    "SupportedMediaTypes": "Video", "DirectPlayProfiles": [],
                    "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac", "Protocol": "hls", "Context": "Streaming", "MaxAudioChannels": "2", "MinSegments": 1, "SegmentLength": 3}],
@@ -208,6 +213,8 @@ def prepare_playback(config, token, user_id, item, audio_index=None, subtitle_in
                 url = config["serverUrl"].rstrip("/") + "/Videos/" + item_id + "/stream?static=true&ApiKey=" + token
             else:
                 play_method = "Transcode"
+    except StopIteration:
+        pass
     except Exception as exc:
         LOG.warning("Transcode setup failed (%s: %s); using direct stream", type(exc).__name__, exc)
     ipc_path = "/tmp/jellyfin-mpv-" + session_id + ".sock"

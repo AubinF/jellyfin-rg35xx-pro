@@ -257,7 +257,7 @@ class Renderer:
         self.wrap(item.get("Overview") or "No description available.", 185, 195, 432, 7)
         ticks = (item.get("UserData") or {}).get("PlaybackPositionTicks", 0)
         label = "Resume %d:%02d" % (ticks // 600000000, (ticks // 10000000) % 60) if ticks > 30000000 else "Play"
-        if item.get("Type") in ("Movie", "Episode", "Video", "MusicVideo"):
+        if item.get("Type") in ("Movie", "Episode", "Video", "MusicVideo", "Audio"):
             pygame.draw.rect(self.screen, ACCENT, (185, 362, 212, 39), border_radius=5)
             self.text("A   " + label, 195, 371, 192, self.font, TEXT, center=True)
         else:
@@ -459,7 +459,7 @@ class LibraryUI:
         if library or item.get("IsFolder") or kind in ("Series", "Season", "Folder", "CollectionFolder", "UserView", "BoxSet"):
             def ready(result):
                 items, total, more = result
-                portrait = not items or items[0].get("Type") not in ("Episode", "Video", "MusicVideo")
+                portrait = not items or items[0].get("Type") not in ("Episode", "Video", "MusicVideo", "Audio")
                 self.pages.append(dict(kind="list", title=item.get("Name", "Library"), parent=item,
                                        items=items, total=total, more=more, next_start=len(items),
                                        selection=0, portrait=portrait, paging=False))
@@ -632,7 +632,7 @@ class LibraryUI:
         else:
             page = self.pages[-1]
             item = page["item"]
-            if item.get("Type") not in ("Movie", "Episode", "Video", "MusicVideo"):
+            if item.get("Type") not in ("Movie", "Episode", "Video", "MusicVideo", "Audio"):
                 return
             options = page.get("options") or page.get("track_options")
             if options:
@@ -655,7 +655,7 @@ class LibraryUI:
                 self.return_home_refresh = True
                 self.direction = (0, 0)
                 pygame.event.clear()
-            self.start("Preparing video...", lambda: self.prepare_playback(
+            self.start("Preparing " + ("audio" if item.get("Type") == "Audio" else "video") + "...", lambda: self.prepare_playback(
                 self.config, self.api.token, self.api.user_id, item, audio_index, subtitle_index), ready)
 
     def back(self):
