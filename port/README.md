@@ -22,6 +22,9 @@ Credentials are encrypted on the device using a device-local key. Never share th
 - Video: **A** pauses, **B**, **Start**, or **Select** returns to the app.
 - Video seeking: D-pad left/right skips 10 seconds; L1/R1 skips 30 seconds; L2/R2 skips 60 seconds.
 - Audio and subtitles: **X** cycles audio tracks; **Y** cycles subtitle tracks, including Off.
+- Music: **A** pauses; D-pad left/right seeks; up/down changes track; **X** shows the queue (there **X** cycles repeat); **Y** shuffles; **R1** opens Music options (favourite, sleep timer, screen off); **B** returns to the library while music keeps playing.
+- Home: **B** returns to Now Playing, or resumes the last queue after a stop or restart.
+- The screen turns off while music plays without input (Settings → Music screen off); any button wakes it.
 - Volume buttons remain controlled by KNULLI.
 
 Automatic KNULLI idle sleep is paused while Jellyfin is open and returns to normal when you exit.

@@ -46,8 +46,30 @@ export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
 BATTSAVER_PAUSE="/var/run/battery-saver/jellyfinrg35xx.pause"
 mkdir -p "${BATTSAVER_PAUSE%/*}"
 : > "$BATTSAVER_PAUSE"
+# Music playback can turn the backlight off. Remember it so even a killed app
+# never leaves the handheld with a dark screen.
+BACKLIGHTS=()
+SAVED_BRIGHTNESS=()
+for bl in /sys/class/backlight/*; do
+  [ -d "$bl" ] || continue
+  BACKLIGHTS+=("$bl")
+  SAVED_BRIGHTNESS+=("$(cat "$bl/brightness" 2>/dev/null)")
+done
+# KNULLI on the H700 has no sysfs backlight; brightness lives behind /dev/disp.
+SAVED_DISP=""
+if [ ${#BACKLIGHTS[@]} -eq 0 ] && [ -e /dev/disp ]; then
+  SAVED_DISP=$(python3 "$GAMEDIR/playback.py" --get-brightness 2>/dev/null)
+  case "$SAVED_DISP" in ''|*[!0-9]*) SAVED_DISP="" ;; esac
+  [ -n "$SAVED_DISP" ] && { [ "$SAVED_DISP" -gt 0 ] && [ "$SAVED_DISP" -le 255 ] || SAVED_DISP=""; }
+fi
 cleanup() {
   rm -f "$BATTSAVER_PAUSE"
+  [ -n "$SAVED_DISP" ] && python3 "$GAMEDIR/playback.py" --set-brightness "$SAVED_DISP" 2>/dev/null
+  for i in "${!BACKLIGHTS[@]}"; do
+    bl="${BACKLIGHTS[$i]}"
+    [ -w "$bl/bl_power" ] && echo 0 > "$bl/bl_power"
+    [ -n "${SAVED_BRIGHTNESS[$i]}" ] && echo "${SAVED_BRIGHTNESS[$i]}" > "$bl/brightness"
+  done
   pm_finish
 }
 trap cleanup EXIT

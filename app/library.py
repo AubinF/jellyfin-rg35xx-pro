@@ -83,18 +83,23 @@ class LibraryAPI:
                           EnableImageTypes="Primary,Thumb,Backdrop")
         return result if isinstance(result, list) else result.get("Items", [])
 
-    def children(self, item, start=0):
+    def children(self, item, start=0, limit=30):
         kind = item.get("Type")
-        params = dict(UserId=self.user_id, Fields=FIELDS, StartIndex=start, Limit=30,
+        params = dict(UserId=self.user_id, Fields=FIELDS, StartIndex=start, Limit=limit,
                       EnableImageTypes="Primary,Thumb,Backdrop")
         if kind == "Series":
             path = "/Shows/" + item["Id"] + "/Seasons"
         elif kind == "Season":
             path = "/Shows/" + item.get("SeriesId", item["Id"]) + "/Episodes"
             params["SeasonId"] = item["Id"]
+        elif kind == "Playlist":
+            # Keep the playlist's own order; the generic items endpoint re-sorts it.
+            path = "/Playlists/" + item["Id"] + "/Items"
         else:
             path = "/Users/" + self.user_id + "/Items"
-            params.update(ParentId=item["Id"], Recursive="false", SortBy="SortName",
+            # Albums list in disc/track order so the play queue follows the record.
+            order = "ParentIndexNumber,IndexNumber,SortName" if kind == "MusicAlbum" else "SortName"
+            params.update(ParentId=item["Id"], Recursive="false", SortBy=order,
                           SortOrder="Ascending")
         result = self.get(path, **params)
         items = result.get("Items", [])
@@ -102,8 +107,34 @@ class LibraryAPI:
             for season in items:
                 season.setdefault("SeriesId", item["Id"])
         total = result.get("TotalRecordCount")
-        more = start + len(items) < total if isinstance(total, int) else len(items) == 30
+        more = start + len(items) < total if isinstance(total, int) else len(items) == limit
         return items, total, more
+
+    def album_tracks(self, parent):
+        """Every track of an album or playlist, in play order: the music queue."""
+        tracks, start, more = [], 0, True
+        while more and start < 1000:
+            items, _, more = self.children(parent, start, limit=200)
+            if not items:
+                break
+            tracks.extend(items)
+            start += len(items)
+        return [track for track in tracks if track.get("Type") == "Audio"]
+
+    def stream_url(self, item):
+        # Same static audio stream as single-track playback; mpv decodes it directly.
+        return self.server + "/Audio/" + item["Id"] + "/stream?static=true&ApiKey=" + self.token
+
+    def report_playing(self, event, item, session_id, ticks, paused=False):
+        endpoint = {"started": "/Sessions/Playing", "progress": "/Sessions/Playing/Progress",
+                    "stopped": "/Sessions/Playing/Stopped"}[event]
+        payload = {"ItemId": item["Id"], "MediaSourceId": item.get("MediaSourceId") or item["Id"],
+                   "PlaySessionId": session_id, "PositionTicks": int(ticks), "IsPaused": paused,
+                   "CanSeek": True, "PlayMethod": "DirectPlay"}
+        with requests.post(self.server + endpoint, headers=self.headers, json=payload,
+                           timeout=(3, 3), verify=self.verify) as response:
+            LOG.info("Music %s HTTP %d", event, response.status_code)
+            response.raise_for_status()
 
     def search(self, term, parent=None):
         """Search the signed-in user's library, optionally within one folder."""
@@ -128,6 +159,20 @@ class LibraryAPI:
         if played:
             item["UserData"]["PlaybackPositionTicks"] = 0
         return item
+
+    def set_favourite(self, item, favourite):
+        path = "/Users/" + self.user_id + "/FavoriteItems/" + item["Id"]
+        method = requests.post if favourite else requests.delete
+        with method(self.server + path, headers=self.headers, timeout=(4, 12), verify=self.verify) as response:
+            response.raise_for_status()
+        item.setdefault("UserData", {})["IsFavorite"] = bool(favourite)
+        return item
+
+    def favourite_songs(self):
+        return self.get("/Users/" + self.user_id + "/Items", Filters="IsFavorite",
+                        IncludeItemTypes="Audio", Recursive="true", Limit=200,
+                        SortBy="AlbumArtist,Album,ParentIndexNumber,IndexNumber", SortOrder="Ascending",
+                        Fields=FIELDS, EnableImageTypes="Primary,Thumb,Backdrop").get("Items", [])
 
     def next_episode(self, item):
         series_id = item.get("SeriesId")
@@ -163,6 +208,9 @@ def image_candidates(item, landscape):
         candidates.append((identity, "Backdrop/0", item["BackdropImageTags"][0]))
     if item.get("SeriesId"):
         candidates.append((item["SeriesId"], "Primary", item.get("SeriesPrimaryImageTag")))
+    if item.get("AlbumId"):
+        # Tracks rarely have their own image; show the album cover instead.
+        candidates.append((item["AlbumId"], "Primary", item.get("AlbumPrimaryImageTag")))
     if item.get("ParentBackdropItemId"):
         candidates.append((item["ParentBackdropItemId"], "Backdrop/0", None))
     return [v for v in candidates if v[0]]

@@ -52,6 +52,8 @@ class MpvIPC:
         self.eof = False
         self.failed = False
         self.connected_once = False
+        # Bounded: video sessions never drain it, music reads start/end-file from it.
+        self.events = collections.deque(maxlen=64)
 
     def connect(self):
         candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -108,10 +110,16 @@ class MpvIPC:
                     # mpv sends null when unloading. Keep the last real position.
                     if value is not None:
                         self.properties[name] = value
+                if message.get("event") == "start-file":
+                    # A new file in the same mpv must not inherit the old position.
+                    self.properties.pop("time-pos", None)
+                    self.properties.pop("duration", None)
                 if message.get("event") == "file-loaded":
                     self.loaded = True
                 if message.get("event") == "end-file":
                     self.failed = message.get("reason") == "error"
+                if message.get("event") not in (None, "property-change"):
+                    self.events.append(message)
 
     def position_ticks(self, fallback):
         value = self.properties.get("time-pos")
@@ -204,6 +212,103 @@ class ControllerInput:
         for fd in self.devices:
             os.close(fd)
         self.devices.clear()
+
+
+DISP_LCD_SET_BRIGHTNESS, DISP_LCD_GET_BRIGHTNESS = 0x102, 0x103
+
+
+def disp_brightness(value=None, path="/dev/disp"):
+    """Get (value=None) or set the LCD brightness, 0-255, through the Allwinner
+    BSP display driver. KNULLI on the H700 has no /sys/class/backlight."""
+    import array
+    import fcntl
+    fd = os.open(path, os.O_RDWR)
+    try:
+        args = array.array("L", [0, value or 0, 0, 0])  # screen 0, brightness
+        request = DISP_LCD_GET_BRIGHTNESS if value is None else DISP_LCD_SET_BRIGHTNESS
+        return fcntl.ioctl(fd, request, args)
+    finally:
+        os.close(fd)
+
+
+class Backlight:
+    """Panel backlight through sysfs, or /dev/disp on Allwinner BSP kernels; a
+    harmless no-op where there is neither (desktop). The launcher also restores
+    brightness on exit in case this process is killed."""
+    def __init__(self, root="/sys/class/backlight", disp="/dev/disp"):
+        self.paths = sorted(glob.glob(os.path.join(root, "*")))
+        self.disp = disp if not self.paths and os.path.exists(disp) else None
+        self.off = False
+        self.saved = {}
+
+    @staticmethod
+    def _read(path, name):
+        try:
+            with open(os.path.join(path, name), encoding="ascii") as source:
+                return source.read().strip()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _write(path, name, value):
+        try:
+            with open(os.path.join(path, name), "w", encoding="ascii") as target:
+                target.write(str(value))
+            return "ok"
+        except OSError as exc:
+            return type(exc).__name__
+
+    def turn_off(self):
+        if self.off:
+            return
+        if self.disp:
+            self._disp_off()
+            return
+        if not self.paths:
+            LOG.info("Backlight off: no backlight control found; screen is only drawn black")
+            return
+        # Some drivers accept bl_power but ignore it, so always zero the brightness
+        # too, on every device: the panel may not be the first one listed.
+        for path in self.paths:
+            self.saved[path] = self._read(path, "brightness")
+            power = self._write(path, "bl_power", 4)
+            brightness = self._write(path, "brightness", 0)
+            LOG.info("Backlight off %s: saved=%s bl_power=%s brightness=%s now=%s",
+                     os.path.basename(path), self.saved[path], power, brightness,
+                     self._read(path, "brightness"))
+        self.off = True
+
+    def _disp_off(self):
+        try:
+            saved = disp_brightness(path=self.disp)
+            # Only dim when the reading is plausible, so restoring can never
+            # leave the panel dark.
+            if not 0 < saved <= 255:
+                LOG.warning("Backlight off: /dev/disp brightness %r is unexpected; not touching it", saved)
+                return
+            disp_brightness(0, self.disp)
+            self.saved[self.disp], self.off = saved, True
+            LOG.info("Backlight off /dev/disp: saved=%d now=%s", saved, disp_brightness(path=self.disp))
+        except OSError as exc:
+            LOG.warning("Backlight off: /dev/disp failed (%s)", type(exc).__name__)
+
+    def turn_on(self):
+        if not self.off:
+            return
+        if self.disp:
+            try:
+                disp_brightness(self.saved[self.disp], self.disp)
+            except OSError as exc:
+                LOG.warning("Backlight on: /dev/disp failed (%s)", type(exc).__name__)
+            self.off = False
+            LOG.info("Backlight on")
+            return
+        for path in self.paths:
+            self._write(path, "bl_power", 0)
+            if self.saved.get(path) is not None:
+                self._write(path, "brightness", self.saved[path])
+        self.off = False
+        LOG.info("Backlight on")
 
 
 class PlaybackReporter:
@@ -397,3 +502,9 @@ def guarded_exec(parent_pid, args):
 
 if __name__ == "__main__" and len(sys.argv) > 3 and sys.argv[1] == "--guard-parent":
     guarded_exec(int(sys.argv[2]), sys.argv[3:])
+# The launcher saves and restores /dev/disp brightness with these, since a
+# killed app cannot turn the screen back on itself.
+if __name__ == "__main__" and sys.argv[1:] == ["--get-brightness"]:
+    print(disp_brightness())
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--set-brightness":
+    disp_brightness(int(sys.argv[2]))

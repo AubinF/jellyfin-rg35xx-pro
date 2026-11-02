@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Music player: picking a track in an album or playlist queues the whole list and keeps playing while you browse.
+- Now Playing screen with cover art, progress, pause, seek (left/right), and previous/next track (up/down).
+- Queue view to see and jump to any track, plus shuffle and repeat (off / all / one).
+- Albums list in track order and playlists keep their own order.
+- Gapless playback: the next track is lined up and pre-buffered so albums flow without a pause.
+- The last queue is saved on the device; **B** on Home resumes it at the same track and position, even after a restart.
+- Favourites: mark the playing track from Music options; a Favourite Songs row appears on Home for music libraries.
+- Sleep timer (15–90 minutes or end of track) that fades the music out.
+- Screen turns off during music playback after a configurable idle time (Settings → Music screen off). On the RG35XX H this sets the panel brightness to 0 through the Allwinner `/dev/disp` driver (KNULLI has no `/sys/class/backlight` there); the launcher restores the brightness on exit.
+
+### Fixed
+
+- The release package now includes `music.py`.
+
 ## [2.1.3] - 2026-09-08
 
 ### Fixed

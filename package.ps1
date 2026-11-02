@@ -13,6 +13,7 @@ Copy-Item -LiteralPath "port/gameinfo.xml" -Destination (Join-Path $stage "jelly
 Copy-Item -LiteralPath "app/jellyfin_rg35xx.py" -Destination (Join-Path $stage "jellyfinrg35xx/jellyfin_rg35xx.py")
 Copy-Item -LiteralPath "app/playback.py" -Destination (Join-Path $stage "jellyfinrg35xx/playback.py")
 Copy-Item -LiteralPath "app/library.py" -Destination (Join-Path $stage "jellyfinrg35xx/library.py")
+Copy-Item -LiteralPath "app/music.py" -Destination (Join-Path $stage "jellyfinrg35xx/music.py")
 Copy-Item -LiteralPath "app/ui.py" -Destination (Join-Path $stage "jellyfinrg35xx/ui.py")
 Copy-Item -LiteralPath "app/assets" -Recurse -Destination (Join-Path $stage "jellyfinrg35xx/assets")
 Copy-Item -LiteralPath "app/assets/portmaster-cover-640.png" -Destination (Join-Path $stage "jellyfinrg35xx/cover.png")
@@ -26,7 +27,7 @@ try {
 } finally {
   $archive.Dispose()
 }
-$required = @('jellyfinrg35xx/jellyfin_rg35xx.py','jellyfinrg35xx/playback.py','jellyfinrg35xx/library.py','jellyfinrg35xx/ui.py','jellyfinrg35xx/config.example.json','jellyfinrg35xx/assets/jellyfin-icon.png','jellyfinrg35xx/assets/portmaster-cover-640.png','jellyfinrg35xx/cover.png','jellyfinrg35xx/gameinfo.xml','Jellyfin RG35XX.sh','jellyfinrg35xx/port.json','jellyfinrg35xx/README.md')
+$required = @('jellyfinrg35xx/jellyfin_rg35xx.py','jellyfinrg35xx/playback.py','jellyfinrg35xx/library.py','jellyfinrg35xx/music.py','jellyfinrg35xx/ui.py','jellyfinrg35xx/config.example.json','jellyfinrg35xx/assets/jellyfin-icon.png','jellyfinrg35xx/assets/portmaster-cover-640.png','jellyfinrg35xx/cover.png','jellyfinrg35xx/gameinfo.xml','Jellyfin RG35XX.sh','jellyfinrg35xx/port.json','jellyfinrg35xx/README.md')
 foreach ($item in $required) { if ($entries -notcontains $item) { throw "Invalid package: missing $item" } }
 $manifest = Get-Content -LiteralPath (Join-Path $stage 'jellyfinrg35xx/port.json') -Raw | ConvertFrom-Json
 $expectedName = [IO.Path]::GetFileName($Output)

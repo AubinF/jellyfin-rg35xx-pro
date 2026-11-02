@@ -47,7 +47,13 @@ For a later update, copy the new file and folder into the same place and allow y
 | Video | **A** pauses or resumes; **B**, **Start**, or **Select** returns to the app |
 | Video seeking | D-pad left/right skips 10 seconds; L1/R1 skips 30 seconds; L2/R2 skips 60 seconds |
 | Audio and subtitles | **X** cycles audio tracks; **Y** cycles subtitle tracks (including Off) |
+| Music | **A** pauses; D-pad left/right seeks 10 seconds; up/down changes track; **X** shows the queue; **Y** shuffles; **R1** opens Music options; **B** returns to the library while music keeps playing |
+| Music queue | D-pad chooses, **A** plays the chosen track, **Y** shuffles, **X** cycles repeat (off / all / one), **B** closes |
+| Music options (R1) | Favourite the track, set a sleep timer (D-pad left/right changes it), or turn the screen off |
+| Home while music plays | **B** returns to Now Playing; after a stop or restart, **B** resumes the last queue where you left it |
 | Volume | The handheld's volume buttons still control KNULLI volume |
+
+Selecting a song in an album or playlist queues the whole list and plays it gaplessly. While music plays, the screen turns off after a period without input (30 seconds by default, change it under **Settings → Music screen off**). Any button turns it back on; that press does nothing else.
 
 On a movie or episode details page, press **X** to open Play Options. Choose an audio track or subtitle track with the D-pad, then press **A** to play with those selections. During playback, **X** and **Y** can also cycle the active audio and subtitle tracks.
 

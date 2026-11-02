@@ -1,4 +1,6 @@
 """640x480 controller UI with Jellyfin home shelves and asynchronous artwork."""
+import atexit
+import json
 import math
 import os
 import time
@@ -6,6 +8,10 @@ import time
 import pygame
 
 from library import Artwork, Jobs, LibraryAPI, Rows
+from music import MusicPlayer, load_session, save_session
+from playback import Backlight
+
+DATA_DIR = os.path.dirname(os.environ.get("JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json"))
 
 BG = (16, 16, 20)
 PANEL = (28, 29, 36)
@@ -14,6 +20,27 @@ MUTED = (161, 165, 180)
 ACCENT = (0, 164, 220)
 BODY = pygame.Rect(0, 66, 640, 370)
 ROW_HEIGHT = 182
+
+
+def clock(seconds):
+    minutes, seconds = divmod(int(max(0, seconds)), 60)
+    return "%d:%02d" % (minutes, seconds)
+
+
+def sleep_label(music):
+    if music.sleep == "track":
+        return "End of track"
+    remaining = music.sleep_remaining()
+    return "%d min" % math.ceil(remaining / 60) if remaining is not None else "Off"
+
+
+SCREEN_OFF_CHOICES = (30, 60, 120, 300, 0)
+
+
+def screen_off_label(seconds):
+    if not seconds:
+        return "Never"
+    return "After %d s" % seconds if seconds < 60 else "After %d min" % (seconds // 60)
 
 
 class Renderer:
@@ -28,14 +55,17 @@ class Renderer:
         self.logo = pygame.transform.smoothscale(pygame.image.load(
             os.path.join(os.path.dirname(__file__), "assets", "jellyfin-icon.png")).convert_alpha(), (35, 35))
         self.scroll = 0.0
+        self.now_playing = ""
+        self.music_hint = ""
 
-    def text(self, value, x, y, width, font=None, color=TEXT, center=False):
+    def text(self, value, x, y, width, font=None, color=TEXT, center=False, right=False):
         font = font or self.font
         value = str(value or "").replace("\n", " ")
         while value and font.size(value)[0] > width:
             value = value[:-2].rstrip("…") + "…" if len(value) > 2 else ""
         image = font.render(value, True, color)
-        self.screen.blit(image, (x + ((width - image.get_width()) // 2 if center else 0), y))
+        offset = (width - image.get_width()) // 2 if center else (width - image.get_width() if right else 0)
+        self.screen.blit(image, (x + offset, y))
 
     def wrap(self, value, x, y, width, lines, font=None, color=MUTED):
         font = font or self.small
@@ -66,7 +96,10 @@ class Renderer:
         self.text("Jellyfin", 59, 15, 122, self.title)
         self.text("Home" if home else "Library", 222, 24, 130, self.font, TEXT)
         pygame.draw.rect(self.screen, ACCENT, (222, 57, 48 if home else 62, 3), border_radius=1)
-        self.text("RG35XX H", 418, 24, 121, self.small, MUTED)
+        if self.now_playing:
+            self.text("♪ " + self.now_playing, 380, 24, 170, self.small, ACCENT)
+        else:
+            self.text("RG35XX H", 418, 24, 121, self.small, MUTED)
         self.text(self.build, 560, 24, 62, self.small, MUTED)
         pygame.draw.line(self.screen, (43, 44, 52), (18, 63), (622, 63))
 
@@ -142,7 +175,9 @@ class Renderer:
             for offset, item in enumerate(items[first:first + 3]):
                 self.card(item, pygame.Rect(18 + offset * 204, y + 31, 188, 144), artwork,
                           index == rows.row and first + offset == col)
-        self.footer("D-pad  Browse rows     A  Open     Y  Search     R1  Settings     Start  Exit")
+        hints = ["D-pad  Browse rows", "A  Open", "Y  Search"] + (["B  " + self.music_hint] if self.music_hint else []) + ["R1  Settings", "Start  Exit"]
+        # Five hints fit with the usual spacing; the extra music hint needs it tighter.
+        self.footer(("   " if self.music_hint else "     ").join(hints))
 
     def keyboard(self, page, loading=False):
         """Controller keyboard modelled on OD Commander's proven 12-by-4 layout."""
@@ -206,7 +241,9 @@ class Renderer:
         self.header(False)
         self.text("Settings", 18, 84, 604, self.heading)
         values = page["values"]
-        fields = [("Quality", values.get("quality", "480p")), ("Server URL", values.get("serverUrl", "")),
+        fields = [("Quality", values.get("quality", "480p")),
+                  ("Music screen off", screen_off_label(values.get("screenOff", 30))),
+                  ("Server URL", values.get("serverUrl", "")),
                   ("Username", values.get("username", "")), ("Password", "Saved"), ("Logout", "Forget saved login"), ("Back", "Return home")]
         for index, (label, value) in enumerate(fields):
             y = 125 + index * 45
@@ -296,6 +333,88 @@ class Renderer:
         self.spinner(320, 365, 12)
         self.footer("Preparing next episode...")
 
+    def player(self, page, music, artwork, status=""):
+        self.header(False)
+        if page["view"] == "queue":
+            self.queue_view(page, music)
+            return
+        queue, track = music.queue, music.current or {}
+        cover = pygame.Rect(30, 90, 210, 210)
+        pygame.draw.rect(self.screen, PANEL, cover, border_radius=6)
+        surface, loading = artwork.get(track, cover.size, True) if artwork else (None, False)
+        if surface:
+            self.screen.blit(surface, (cover.centerx - surface.get_width() // 2,
+                                       cover.centery - surface.get_height() // 2))
+        elif loading:
+            self.spinner(*cover.center)
+        else:
+            self.text("♪", cover.x, cover.centery - 30, cover.width, self.title, MUTED, center=True)
+        x, width = 266, 356
+        self.text("Now playing", x, 94, width, self.small, MUTED)
+        if (track.get("UserData") or {}).get("IsFavorite"):
+            self.text("♥ Favourite", x, 94, width - 4, self.small, ACCENT, right=True)
+        self.wrap(track.get("Name") or "Untitled", x, 118, width, 2, self.heading, TEXT)
+        self.text(", ".join(track.get("Artists") or []) or track.get("AlbumArtist"), x, 180, width, self.font, TEXT)
+        self.text(track.get("Album"), x, 206, width, self.small, MUTED)
+        self.text("Track %d of %d" % (queue.position + 1, len(queue.order)), x, 236, width, self.small, MUTED)
+        chip_x = x
+        chips = [("Shuffle", queue.shuffle), ("Repeat " + queue.repeat, queue.repeat != "off")]
+        if music.sleep:
+            chips.append(("Sleep " + sleep_label(music), True))
+        for label, on in chips:
+            chip = pygame.Rect(chip_x, 266, self.small.size(label)[0] + 22, 26)
+            pygame.draw.rect(self.screen, ACCENT if on else PANEL, chip, border_radius=13)
+            self.text(label, chip.x, chip.y + 4, chip.width, self.small, TEXT if on else MUTED, center=True)
+            chip_x = chip.right + 8
+        elapsed, duration = music.position()
+        bar = pygame.Rect(30, 328, 580, 6)
+        pygame.draw.rect(self.screen, PANEL, bar, border_radius=3)
+        if duration:
+            pygame.draw.rect(self.screen, ACCENT, (bar.x, bar.y, round(bar.width * min(1, elapsed / duration)), bar.height), border_radius=3)
+        self.text(clock(elapsed), bar.x, 342, 100, self.small, MUTED)
+        total = clock(duration) if duration else "--:--"
+        self.text(total, bar.right - self.small.size(total)[0], 342, 100, self.small, MUTED)
+        state = "Paused" if music.paused else ("Playing" if music.started else "Loading...")
+        self.text(state, 18, 368, 604, self.heading, TEXT if music.paused else ACCENT, center=True)
+        self.text(status or music.status, 18, 406, 604, self.small, MUTED, center=True)
+        self.footer(("A  Play" if music.paused else "A  Pause") + "    ◀ ▶  Seek    ▲ ▼  Track    X  Queue    Y  Shuffle    R1  More    B  Back")
+        options = page.get("options")
+        if options:
+            favourite = (track.get("UserData") or {}).get("IsFavorite")
+            rows = [("Favourite", "♥ Yes" if favourite else "No"), ("Sleep timer", sleep_label(music)),
+                    ("Screen", "Turn off now")]
+            pygame.draw.rect(self.screen, (30, 32, 41), (120, 150, 400, 162), border_radius=8)
+            self.text("Music options", 140, 164, 360, self.heading)
+            for index, (label, value) in enumerate(rows):
+                y = 202 + index * 34
+                if index == options["row"]:
+                    pygame.draw.rect(self.screen, ACCENT, (134, y - 4, 372, 28), border_radius=4)
+                self.text(label, 148, y, 130, self.font, TEXT)
+                self.text(value, 290, y + 2, 206, self.small, TEXT)
+            self.footer("▲ ▼  Choose     A  Change     ◀ ▶  Sleep time     B  Close")
+
+    def queue_view(self, page, music):
+        queue = music.queue
+        tracks = queue.upcoming()
+        self.text("Queue", 18, 79, 280, self.heading)
+        mode = ("Shuffle on" if queue.shuffle else "In order") + " · Repeat " + queue.repeat
+        self.text(mode, 622 - self.small.size(mode)[0], 84, 330, self.small, MUTED)
+        rows = 10
+        first = max(0, min(page["selection"] - rows // 2, len(tracks) - rows))
+        for offset, track in enumerate(tracks[first:first + rows]):
+            index, y = first + offset, 114 + offset * 31
+            selected, playing = index == page["selection"], index == queue.position
+            if selected:
+                pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 28), border_radius=4)
+            self.text("▶" if playing else str(index + 1), 26, y + 5, 34, self.small,
+                      TEXT if selected or playing else MUTED, center=True)
+            self.text(track.get("Name") or "Untitled", 66, y + 4, 380, self.font,
+                      TEXT if selected else (ACCENT if playing else TEXT))
+            self.text(", ".join(track.get("Artists") or []), 456, y + 6, 104, self.small, TEXT if selected else MUTED)
+            if track.get("RunTimeTicks"):
+                self.text(clock(track["RunTimeTicks"] / 10000000), 566, y + 6, 50, self.small, TEXT if selected else MUTED)
+        self.footer("▲ ▼  Choose     A  Play     Y  Shuffle     X  Repeat     B  Close")
+
 
 class LibraryUI:
     def __init__(self, config, error, build, authenticate, play_item, prepare_playback, headers, verify, save_config, normalize_server_url=None):
@@ -316,6 +435,15 @@ class LibraryUI:
         self.loading = ""
         self.status = error or ""
         self.reporter = None
+        self.music = None
+        self.session_path = os.path.join(DATA_DIR, "music-queue.json")
+        self.session_text = None
+        self.session_save_at = 0
+        self.backlight = Backlight()
+        # Never leave the panel dark, even after an uncaught exception.
+        atexit.register(self.backlight.turn_on)
+        self.dark = False
+        self.last_input = time.monotonic()
         self.running = True
         self.home_generation = 0
         self.return_home_refresh = False
@@ -354,12 +482,17 @@ class LibraryUI:
         if page["selection"] == 0:
             page["values"]["quality"] = {"480p": "720p", "720p": "1080p", "1080p": "360p", "360p": "480p"}.get(page["values"].get("quality"), "480p")
         elif page["selection"] == 1:
-            self.begin_input("serverUrl", "Server URL")
+            current = page["values"].get("screenOff", 30)
+            choice = SCREEN_OFF_CHOICES.index(current) if current in SCREEN_OFF_CHOICES else -1
+            page["values"]["screenOff"] = SCREEN_OFF_CHOICES[(choice + 1) % len(SCREEN_OFF_CHOICES)]
+            self.config["screenOff"] = page["values"]["screenOff"]
         elif page["selection"] == 2:
-            self.begin_input("username", "Username")
+            self.begin_input("serverUrl", "Server URL")
         elif page["selection"] == 3:
-            self.begin_input("password", "Password", True)
+            self.begin_input("username", "Username")
         elif page["selection"] == 4:
+            self.begin_input("password", "Password", True)
+        elif page["selection"] == 5:
             page["confirm_logout"] = True
         else:
             self.pages.pop()
@@ -403,6 +536,13 @@ class LibraryUI:
     def connected(self, credentials):
         token, user = credentials
         self.api = LibraryAPI(self.config, token, user, self.headers(token), self.verify)
+        if self.music:
+            self.music.stop()
+        self.music = MusicPlayer(self.api.stream_url, self.api.report_playing, token)
+        session = load_session(self.session_path)
+        # Only offer a saved queue to the account and server that played it.
+        if session and session.get("server") == self.api.server and session.get("user") == user:
+            self.music.last_session = session
         self.artwork = Artwork(self.api, os.path.join(os.path.dirname(os.environ.get(
             "JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json")), "cache", "artwork"))
         self.refresh()
@@ -417,6 +557,9 @@ class LibraryUI:
             values = [{"title": "My Media", "items": views, "loaded": True},
                       {"title": "Next Up", "fetch": self.api.next_up, "empty": "You are all caught up"},
                       {"title": "Continue Watching", "fetch": self.api.resume, "empty": "No unfinished videos"}]
+            if any(view.get("CollectionType") == "music" for view in views):
+                values.append({"title": "Favourite Songs", "fetch": self.api.favourite_songs,
+                               "empty": "Add favourites from Now Playing with R1"})
             for view in views:
                 values.append({"title": "Recently Added in " + view.get("Name", "Library"),
                                "fetch": lambda parent=view["Id"]: self.api.latest(parent)})
@@ -424,6 +567,10 @@ class LibraryUI:
         self.start("Loading My Media...", self.api.views, ready)
 
     def logout(self):
+        if self.music:
+            self.music.stop()
+            self.save_music_session()
+            self.music = None
         self.api = self.artwork = None
         self.pages = []
         self.rows = Rows([])
@@ -464,6 +611,15 @@ class LibraryUI:
                                        items=items, total=total, more=more, next_start=len(items),
                                        selection=0, portrait=portrait, paging=False))
             self.start("Opening " + item.get("Name", "folder") + "...", lambda: self.api.children(item), ready)
+        elif kind == "Audio":
+            source = self.pages[-1] if self.pages and self.pages[-1]["kind"] == "list" else None
+            if source:
+                self.play_music(item, parent=source["parent"])
+            elif not self.pages:
+                # A home shelf such as Favourite Songs plays as its own queue.
+                self.play_music(item, tracks=self.rows.values[self.rows.row].get("items"))
+            else:
+                self.play_music(item)
         else:
             self.start("Loading details...", lambda: self.api.detail(item),
                        lambda value: self.pages.append(dict(kind="detail", item=value, options=None, track_options=None)))
@@ -477,24 +633,95 @@ class LibraryUI:
                 self.pages[-1]["item"] = value
         self.start(label, lambda: self.api.set_played(item, played), done)
 
-    def play_episode_chain(self, item, prepared=None):
-        self.screen, self.status, self.reporter = self.play_item(
-            self.config, self.api.token, self.api.user_id, item, prepared=prepared)
-        self.renderer.screen = self.screen
-        final_item = item
-        if item.get("_PlaybackCompleted") and item.get("Type") == "Episode":
+    def play_chain(self, item, prepared=None):
+        """Play item, then the next episode while each one plays to the end."""
+        while True:
+            self.screen, self.status, self.reporter = self.play_item(
+                self.config, self.api.token, self.api.user_id, item, prepared=prepared)
+            self.renderer.screen = self.screen
+            if not (item.pop("_PlaybackCompleted", False) and item.get("Type") == "Episode"):
+                break
             next_item = self.api.next_episode(item)
-            if next_item:
-                self.status = "Playing next episode..."
-                self.renderer.next_episode_splash(next_item)
-                pygame.display.flip()
-                next_prepared = self.prepare_playback(
-                    self.config, self.api.token, self.api.user_id, next_item)
-                final_item = self.play_episode_chain(next_item, next_prepared)
+            if not next_item:
+                break
+            self.status = "Playing next episode..."
+            self.renderer.next_episode_splash(next_item)
+            pygame.display.flip()
+            prepared = self.prepare_playback(
+                self.config, self.api.token, self.api.user_id, next_item)
+            item = next_item
         if self.pages and self.pages[-1].get("kind") == "detail":
-            self.pages[-1]["item"] = final_item
-        item.pop("_PlaybackCompleted", None)
-        return final_item
+            self.pages[-1]["item"] = item
+        return item
+
+    def play_music(self, item, parent=None, tracks=None):
+        """Queue the album/playlist parent (or given tracks) starting at item; just item otherwise."""
+        def work():
+            queue = self.api.album_tracks(parent) if parent else [t for t in tracks or [] if t.get("Type") == "Audio"]
+            ids = [track.get("Id") for track in queue]
+            return (queue, ids.index(item["Id"])) if item.get("Id") in ids else ([item], 0)
+        def ready(result):
+            self.music.play(*result)
+            self.open_player()
+        self.start("Preparing music...", work, ready)
+
+    def open_player(self):
+        self.status = ""
+        if not (self.pages and self.pages[-1]["kind"] == "player"):
+            self.pages.append(dict(kind="player", view="now", selection=0, options=None))
+
+    def save_music_session(self):
+        """Persist the queue only when it changed; position is kept to the nearest 10 s."""
+        if not self.music or not self.api:
+            return
+        session = self.music.session()
+        if session:
+            session = dict(session, server=self.api.server, user=self.api.user_id,
+                           elapsed=int(session.get("elapsed") or 0) // 10 * 10)
+        text = json.dumps(session, sort_keys=True)
+        if text != self.session_text:
+            save_session(self.session_path, session)
+            self.session_text = text
+
+    def toggle_favourite(self, track):
+        favourite = not (track.get("UserData") or {}).get("IsFavorite")
+        def done(value):
+            self.status = "Added to favourites" if favourite else "Removed from favourites"
+        self.start("Saving favourite...", lambda: self.api.set_favourite(track, favourite), done)
+
+    def go_dark(self):
+        self.dark = True
+        self.direction = (0, 0)
+        self.backlight.turn_off()
+        # Without a sysfs backlight (desktop) a black frame still shows the state.
+        self.screen.fill((0, 0, 0))
+        pygame.display.flip()
+
+    def wake(self):
+        self.dark = False
+        self.backlight.turn_on()
+        self.last_input = time.monotonic()
+
+    def player_button(self, button):
+        """X, Y and R1 on the music screens; A/B go through activate() and back()."""
+        page = self.pages[-1]
+        if button == 8:
+            page["options"] = None if page.get("options") else {"row": 0}
+            page["view"] = "now"
+            return True
+        if page.get("options"):
+            return button in (5, 6, 7)
+        if button == 6:
+            if page["view"] == "now":
+                page["view"], page["selection"] = "queue", self.music.queue.position
+            else:
+                self.music.cycle_repeat()
+            return True
+        if button in (5, 7):
+            self.music.toggle_shuffle()
+            page["selection"] = self.music.queue.position
+            return True
+        return False
 
     def options_for(self, item):
         streams = ((item.get("MediaSources") or [{}])[0].get("MediaStreams")
@@ -566,7 +793,7 @@ class LibraryUI:
             return True
         return False
 
-    def move(self, x, y):
+    def move(self, x, y, repeat=False):
         if self.pending:
             return
         if not self.api and self.setup_page and not self.pages:
@@ -576,6 +803,23 @@ class LibraryUI:
             self.rows.move(x, y)
             return
         page = self.pages[-1]
+        if page["kind"] == "player":
+            options = page.get("options")
+            if options:
+                if y:
+                    options["row"] = max(0, min(2, options["row"] - y))
+                elif x and not repeat and options["row"] == 1:
+                    self.music.cycle_sleep(x)
+            elif page["view"] == "queue":
+                if y:
+                    page["selection"] = max(0, min(len(self.music.queue.order) - 1, page["selection"] - y))
+            elif y and not repeat:
+                # Holding up/down must not skip through the whole queue.
+                # Up/down follow the queue list: up is the previous track.
+                self.music.previous() if y > 0 else self.music.next()
+            elif x:
+                self.music.seek(10 * x)
+            return
         if page["kind"] in ("search", "input"):
             if page["focus"] == "results":
                 if x:
@@ -591,7 +835,7 @@ class LibraryUI:
                 page["key_x"] = min(page["key_x"], len(rows[page["key_y"]]) - 1)
             return
         if page["kind"] == "settings":
-            if y: page["selection"] = max(0, min(5, page["selection"] - y))
+            if y: page["selection"] = max(0, min(6, page["selection"] - y))
             return
         if page["kind"] == "detail" and page.get("options"):
             options = page["options"]
@@ -615,6 +859,23 @@ class LibraryUI:
             self.setup_activate(); return
         if self.pages and self.pages[-1]["kind"] == "settings":
             self.settings_activate(); return
+        if self.pages and self.pages[-1]["kind"] == "player":
+            page = self.pages[-1]
+            options = page.get("options")
+            if options:
+                if options["row"] == 0:
+                    self.toggle_favourite(self.music.current)
+                elif options["row"] == 1:
+                    self.music.cycle_sleep(1)
+                else:
+                    page["options"] = None
+                    self.go_dark()
+            elif page["view"] == "queue":
+                self.music.jump(page["selection"])
+                page["view"] = "now"
+            else:
+                self.music.toggle_pause()
+            return
         if not self.pages:
             self.open_item(self.rows.selected(), self.rows.row == 0)
         elif self.pages[-1]["kind"] in ("search", "input"):
@@ -649,13 +910,18 @@ class LibraryUI:
             if self.reporter and not self.reporter.finished.is_set():
                 self.status = "Saving previous playback..."
                 return
+            if item.get("Type") == "Audio":
+                self.play_music(item); return
+            if self.music.active:
+                # Video takes the display and audio device; music cannot continue under it.
+                self.music.stop()
             def ready(prepared):
-                self.play_episode_chain(item, prepared)
+                self.play_chain(item, prepared)
                 self.renderer.screen = self.screen
                 self.return_home_refresh = True
                 self.direction = (0, 0)
                 pygame.event.clear()
-            self.start("Preparing " + ("audio" if item.get("Type") == "Audio" else "video") + "...", lambda: self.prepare_playback(
+            self.start("Preparing video...", lambda: self.prepare_playback(
                 self.config, self.api.token, self.api.user_id, item, audio_index, subtitle_index), ready)
 
     def back(self):
@@ -671,6 +937,15 @@ class LibraryUI:
             self.pages[-1]["options"] = None
         elif self.pages and self.pages[-1]["kind"] == "search" and self.pages[-1]["focus"] == "results":
             self.pages[-1]["focus"] = "keys"
+        elif self.pages and self.pages[-1]["kind"] == "player" and self.pages[-1].get("options"):
+            self.pages[-1]["options"] = None
+        elif self.pages and self.pages[-1]["kind"] == "player" and self.pages[-1]["view"] == "queue":
+            self.pages[-1]["view"] = "now"
+        elif not self.pages and self.music and self.music.active:
+            self.open_player()
+        elif not self.pages and self.music and self.music.last_session:
+            self.music.resume(self.music.last_session)
+            self.open_player()
         elif self.pages:
             if self.pages[-1]["kind"] == "input" and self.setup_page and self.setup_page.get("return_settings"):
                 self.setup_page = None
@@ -680,6 +955,10 @@ class LibraryUI:
                 self.refresh()
 
     def draw(self):
+        playing = self.music.current if self.music and self.music.active else None
+        self.renderer.now_playing = (playing or {}).get("Name", "")
+        self.renderer.music_hint = ("Music" if playing else
+                                    "Resume music" if self.music and self.music.last_session else "")
         if not self.api:
             if self.pages and self.pages[-1]["kind"] == "input":
                 self.renderer.keyboard(self.pages[-1], bool(self.pending))
@@ -694,6 +973,8 @@ class LibraryUI:
             self.renderer.keyboard(page, bool(self.pending))
         elif self.pages[-1]["kind"] == "settings":
             self.renderer.settings(self.pages[-1])
+        elif self.pages[-1]["kind"] == "player":
+            self.renderer.player(self.pages[-1], self.music, self.artwork, self.status)
         elif self.pages[-1]["kind"] == "list":
             page = self.pages[-1]
             self.renderer.listing(page, self.artwork, bool(self.pending))
@@ -717,7 +998,25 @@ class LibraryUI:
             if self.reporter and self.reporter.finished.is_set():
                 self.status = "Progress saved" if self.reporter.stop_ok else "Could not save progress to Jellyfin"
                 self.reporter = None
+            if self.music:
+                was_active = self.music.active
+                self.music.update()
+                player_page = next((page for page in self.pages if page["kind"] == "player"), None)
+                if player_page and not self.music.active:
+                    # The queue ended or failed: leave the music screen with its message.
+                    self.pages.remove(player_page)
+                    self.status = self.music.status or "Music stopped"
+                if was_active != self.music.active or time.monotonic() >= self.session_save_at:
+                    self.save_music_session()
+                    self.session_save_at = time.monotonic() + 5
             for event in pygame.event.get():
+                if (event.type in (pygame.JOYBUTTONDOWN, pygame.KEYDOWN)
+                        or (event.type == pygame.JOYHATMOTION and event.value != (0, 0))):
+                    self.last_input = time.monotonic()
+                    if self.dark:
+                        # The waking press only turns the screen back on.
+                        self.wake()
+                        continue
                 if event.type == pygame.QUIT:
                     self.running = False
                 elif event.type == pygame.JOYHATMOTION:
@@ -726,6 +1025,8 @@ class LibraryUI:
                     self.repeat_at = time.monotonic() + 0.35
                 elif event.type == pygame.JOYBUTTONDOWN:
                     if self.pages and self.pages[-1]["kind"] in ("search", "input") and self.keyboard_button(event.button):
+                        continue
+                    if self.pages and self.pages[-1]["kind"] == "player" and self.player_button(event.button):
                         continue
                     if event.button == 8 and not self.pages and self.api:
                         self.begin_settings()
@@ -767,18 +1068,32 @@ class LibraryUI:
                         if self.pages and self.pages[-1]["kind"] == "search":
                             page = self.pages[-1]
                             page["layer"] = (page["layer"] + 1) % len(page["layers"])
+                    elif event.key in (pygame.K_x, pygame.K_y, pygame.K_o) and self.pages and self.pages[-1]["kind"] == "player":
+                        self.player_button({pygame.K_x: 6, pygame.K_y: 5, pygame.K_o: 8}[event.key])
                     elif event.key == pygame.K_y and not self.pages:
                         self.begin_search()
                     elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
                         self.move(*{pygame.K_LEFT: (-1, 0), pygame.K_RIGHT: (1, 0), pygame.K_UP: (0, 1), pygame.K_DOWN: (0, -1)}[event.key])
             if self.direction != (0, 0) and time.monotonic() >= self.repeat_at:
-                self.move(*self.direction)
+                self.move(*self.direction, repeat=True)
                 self.repeat_at = time.monotonic() + 0.15
+            timeout = (self.config or {}).get("screenOff", 30)
+            if (not self.dark and timeout and self.music and self.music.active and not self.music.paused
+                    and not self.pending and time.monotonic() - self.last_input > timeout):
+                self.go_dark()
+            if self.dark:
+                # Nothing to draw; a slow loop still feeds mpv IPC and the sleep timer.
+                clock.tick(5)
+                continue
             self.draw()
             pygame.display.flip()
             clock.tick(30)
+        self.backlight.turn_on()
+        reporters = [self.reporter, self.music.stop() if self.music else None]
+        self.save_music_session()
         deadline = time.monotonic() + 25
-        while self.reporter and not self.reporter.finished.is_set() and time.monotonic() < deadline:
+        while (any(r and not r.finished.is_set() for r in reporters)
+               and time.monotonic() < deadline):
             pygame.event.pump()
             self.renderer.header()
             self.renderer.loading("Saving playback progress...", False)
