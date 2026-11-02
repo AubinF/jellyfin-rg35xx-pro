@@ -1,19 +1,27 @@
 """640x480 controller UI with Jellyfin home shelves and asynchronous artwork."""
 import atexit
+import hashlib
 import json
+import logging
 import math
 import os
 import time
 
 import pygame
 
-from library import Artwork, Jobs, LibraryAPI, Rows
+from downloads import Downloads, free_bytes, on_real_storage, safe_name, storage_choices
+from library import Artwork, Jobs, LibraryAPI, OfflineLibrary, Rows
 from music import (SAVED_QUEUES, MusicPlayer, forget_session, load_sessions, queue_key,
                    remember_session, save_sessions, session_queue)
 from playback import Backlight, MediaKeys
 
+# SDL joystick index of R2 on the RG35XX H/Pro (Linux BTN_TR2, code 315). Found with a
+# button probe on the Pro: SDL numbers there are the evdev order shifted by 3
+# (A=3, B=4, R1=8, Select/Start/Menu=9/10/11, L1=7, L2=13, R2=14).
+R2_BUTTON = 14
 MEDIA_KEYS = {getattr(pygame, name) for name in ("K_AUDIOPLAY", "K_AUDIOSTOP", "K_AUDIONEXT", "K_AUDIOPREV",
                                                  "K_AUDIOPAUSE", "K_MEDIASELECT", "K_UNKNOWN") if hasattr(pygame, name)}
+LOG = logging.getLogger("jellyfin.ui")
 DATA_DIR = os.path.dirname(os.environ.get("JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json"))
 
 BG = (16, 16, 20)
@@ -40,6 +48,32 @@ def sleep_label(music):
 SCREEN_OFF_CHOICES = (30, 60, 120, 300, 0)
 
 
+def folder_rows(page):
+    """Rows of the folder browser: actions first, then the subfolders."""
+    rows = [("use", ""), ("new", "")]
+    if page["path"] != "/":
+        rows.append(("up", ""))
+    return rows + [("dir", name) for name in page["dirs"]]
+
+
+def list_folders(path):
+    """Visible subfolders of path, sorted like a file manager; (names, error)."""
+    try:
+        with os.scandir(path) as entries:
+            names = [e.name for e in entries if not e.name.startswith(".") and e.is_dir()]
+    except OSError as exc:
+        return [], "Can't open this folder (%s)" % type(exc).__name__
+    return sorted(names, key=str.lower)[:500], ""
+
+
+def size_label(size):
+    if size >= 10 * 1024 ** 3:
+        return "%d GB" % (size // 1024 ** 3)
+    if size >= 1024 ** 3:
+        return "%.1f GB" % (size / 1024 ** 3)
+    return "%d MB" % round(size / 1024 ** 2)
+
+
 def screen_off_label(seconds):
     if not seconds:
         return "Never"
@@ -60,6 +94,7 @@ class Renderer:
         self.scroll = 0.0
         self.now_playing = ""
         self.music_hint = ""
+        self.offline = False
 
     def text(self, value, x, y, width, font=None, color=TEXT, center=False, right=False):
         font = font or self.font
@@ -100,7 +135,9 @@ class Renderer:
         self.text("Home" if home else "Library", 222, 24, 130, self.font, TEXT)
         pygame.draw.rect(self.screen, ACCENT, (222, 57, 48 if home else 62, 3), border_radius=1)
         if self.now_playing:
-            self.text("♪ " + self.now_playing, 380, 24, 170, self.small, ACCENT)
+            self.text(("Offline · ♪ " if self.offline else "♪ ") + self.now_playing, 380, 24, 170, self.small, ACCENT)
+        elif self.offline:
+            self.text("Offline", 418, 24, 121, self.small, ACCENT)
         else:
             self.text("RG35XX H", 418, 24, 121, self.small, MUTED)
         self.text(self.build, 560, 24, 62, self.small, MUTED)
@@ -178,9 +215,14 @@ class Renderer:
             for offset, item in enumerate(items[first:first + 3]):
                 self.card(item, pygame.Rect(18 + offset * 204, y + 31, 188, 144), artwork,
                           index == rows.row and first + offset == col)
-        hints = ["D-pad  Browse rows", "A  Open", "Y  Search"] + (["B  " + self.music_hint] if self.music_hint else []) + ["R1  Settings", "Start  Exit"]
-        # Five hints fit with the usual spacing; the extra music hint needs it tighter.
-        self.footer(("   " if self.music_hint else "     ").join(hints))
+        if self.offline:
+            hints = (["D-pad  Browse", "A  Play", "X  Go online"] + (["B  " + self.music_hint] if self.music_hint else [])
+                     + ["R2  Queues", "R1  Settings", "Start  Exit"])
+        else:
+            hints = (["D-pad  Browse", "A  Open", "Y  Search"] + (["B  " + self.music_hint] if self.music_hint else [])
+                     + ["R2  Queues", "R1  Settings", "Start  Exit"])
+        # Six or seven hints only fit with tighter spacing.
+        self.footer("   ".join(hints))
 
     def keyboard(self, page, loading=False):
         """Controller keyboard modelled on OD Commander's proven 12-by-4 layout."""
@@ -246,14 +288,15 @@ class Renderer:
         values = page["values"]
         fields = [("Quality", values.get("quality", "480p")),
                   ("Music screen off", screen_off_label(values.get("screenOff", 30))),
+                  ("Downloads", values.get("downloadPath") or "Choose where to keep them"),
                   ("Server URL", values.get("serverUrl", "")),
                   ("Username", values.get("username", "")), ("Password", "Saved"), ("Logout", "Forget saved login"), ("Back", "Return home")]
         for index, (label, value) in enumerate(fields):
-            y = 125 + index * 45
+            y = 122 + index * 39
             selected = index == page["selection"]
-            pygame.draw.rect(self.screen, ACCENT if selected else PANEL, (18, y, 604, 36), border_radius=5)
-            self.text(label, 31, y + 9, 160, self.font, TEXT)
-            self.text(value or "Not set", 210, y + 9, 392, self.font, TEXT if value else MUTED)
+            pygame.draw.rect(self.screen, ACCENT if selected else PANEL, (18, y, 604, 33), border_radius=5)
+            self.text(label, 31, y + 7, 170, self.font, TEXT)
+            self.text(value or "Not set", 210, y + 7, 392, self.font, TEXT if value else MUTED)
         self.footer("D-pad  Choose     A  Edit     B  Back     Start  Exit")
         if page.get("confirm_logout"):
             pygame.draw.rect(self.screen, (30, 32, 41), (82, 184, 476, 112), border_radius=8)
@@ -280,9 +323,92 @@ class Renderer:
             else:
                 rect = pygame.Rect(18 + (offset % 3) * 204, 121 + (offset // 3) * 153, 188, 139)
             self.card(item, rect, artwork, first + offset == selected, not portrait)
-        if page.get("more"):
-            self.text("More titles load as you browse", 18, 411, 580, self.small, MUTED)
-        self.footer("D-pad  Browse     A  Open     X  Watched     Y  Search     B  Back     Start  Exit")
+        # The download status sits in the strip between the last card row (its
+        # subtitle ends near y=416) and the footer, so it never covers card text.
+        if page.get("download") is not None:
+            # A music page: show where its offline copy stands instead of Watched.
+            self.text(page["download"], 306, 420, 316, self.small, ACCENT, right=True)
+            self.footer("D-pad  Browse     A  Play     R1  Download     Y  Search     B  Back     Start  Exit")
+        else:
+            self.footer("D-pad  Browse     A  Open     X  Watched     Y  Search     B  Back     Start  Exit")
+
+    def downloads(self, page, entries, location, free, summary, status=""):
+        self.header(False)
+        self.text("Downloads", 18, 79, 200, self.heading)
+        message = "Press X again to remove it" if page.get("confirm") is not None else (status or summary)
+        self.text(message, 222, 84, 400, self.small, ACCENT if message else MUTED, right=True)
+        rows = [None] + entries
+        first = max(0, min(page["selection"] - 4, len(rows) - 9))
+        for offset, entry in enumerate(rows[first:first + 9]):
+            index, y = first + offset, 114 + offset * 34
+            selected = index == page["selection"]
+            if selected:
+                pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 30), border_radius=4)
+            muted = TEXT if selected else MUTED
+            if entry is None:
+                self.text("Location", 28, y + 5, 120, self.font, TEXT)
+                self.text(location or "Not chosen yet", 130, y + 7, 380, self.small, muted)
+                if location:
+                    self.text(size_label(free) + " free", 482, y + 7, 130, self.small, muted, right=True)
+                continue
+            self.text(entry["title"], 28, y + 5, 300, self.font, TEXT)
+            state = {"done": "✓ %d tracks" % entry["total"],
+                     "downloading": "%d/%d · %d%%" % (entry["done"] + 1, entry["total"], entry["progress"] * 100),
+                     "queued": "Queued · %d/%d" % (entry["done"], entry["total"]),
+                     "paused": "Paused · %d/%d" % (entry["done"], entry["total"]),
+                     "failed": "Failed · %d/%d · Y retry" % (entry["done"], entry["total"]),
+                     "incomplete": "%d/%d · Y resume" % (entry["done"], entry["total"])}[entry["state"]]
+            self.text(state, 336, y + 7, 180, self.small, TEXT if selected else (ACCENT if entry["state"] == "downloading" else MUTED))
+            self.text(size_label(entry["size"]), 516, y + 7, 96, self.small, muted, right=True)
+        if not entries:
+            self.text("Open an album, playlist or audiobook and press R1", 18, 250, 604, self.font, MUTED, center=True)
+        self.footer("▲ ▼  Choose     A  Play / Change     X  Remove     Y  Retry     B  Back")
+
+    def storage(self, page, choices, current):
+        self.header(False)
+        self.text("Download location", 18, 79, 300, self.heading)
+        self.text("Current: " + (current or "not chosen"), 18, 106, 604, self.small, MUTED)
+        rows = choices + [{"label": "Browse folders...", "path": "", "free": None},
+                          {"label": "Type a folder...", "path": "", "free": None}]
+        for index, choice in enumerate(rows):
+            y, selected = 136 + index * 48, index == page["selection"]
+            pygame.draw.rect(self.screen, ACCENT if selected else PANEL, (18, y, 604, 42), border_radius=5)
+            self.text(choice["label"], 31, y + (3 if choice["path"] else 11), 380, self.font, TEXT)
+            if choice["path"]:
+                self.text(choice["path"], 31, y + 23, 420, self.small, TEXT if selected else MUTED)
+            if choice["free"] is not None:
+                self.text(size_label(choice["free"]) + " free", 440, y + 12, 170, self.small, TEXT, right=True)
+        if not choices:
+            self.text("No storage found; browse or type a folder instead", 18, 136 + len(rows) * 48, 604, self.small, MUTED)
+        self.footer("▲ ▼  Choose     A  Use this location     B  Back")
+
+    def folders(self, page, free, status=""):
+        """Folder browser for the download location."""
+        self.header(False)
+        self.text("Choose a folder", 18, 79, 300, self.heading)
+        if page.get("memory"):
+            # Before a card is mounted its /media folder is only RAM: say so up front.
+            self.text("In memory only, not on a card", 322, 84, 300, self.small, ACCENT, right=True)
+        else:
+            self.text(size_label(free) + " free" if free else "", 422, 84, 200, self.small, MUTED, right=True)
+        path = page["path"]
+        while len(path) > 1 and self.small.size(path)[0] > 604:
+            path = "…" + path[2:]  # keep the end of long paths: that is the folder you are in
+        self.text(path, 18, 106, 604, self.small, ACCENT)
+        rows = folder_rows(page)
+        first = max(0, min(page["selection"] - 4, len(rows) - 9))
+        for offset, (kind, name) in enumerate(rows[first:first + 9]):
+            index, y = first + offset, 130 + offset * 33
+            selected = index == page["selection"]
+            if selected:
+                pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 29), border_radius=4)
+            label = {"use": "✓  Use this folder", "new": "+  New folder...", "up": "..  Up one level"}.get(kind, "▸  " + name)
+            self.text(label, 30, y + 5, 580, self.font, TEXT if selected or kind != "dir" else (221, 223, 232))
+        if page.get("error"):
+            self.text(page["error"], 18, 130 + min(len(rows), 9) * 33 + 4, 604, self.small, MUTED)
+        elif status:
+            self.text(status, 18, 418, 604, self.small, MUTED)
+        self.footer("▲ ▼  Choose     A  Open / Use     B  Back")
 
     def detail(self, item, artwork, status, options=None):
         self.header(False)
@@ -467,6 +593,7 @@ class LibraryUI:
         self.status = error or ""
         self.reporter = None
         self.music = None
+        self.downloads = None
         self.session_path = os.path.join(DATA_DIR, "music-queue.json")
         # Saved queues for every account on this device, most recently played first.
         self.sessions = []
@@ -478,6 +605,8 @@ class LibraryUI:
         self.dark = False
         self.last_input = time.monotonic()
         self.media_keys = MediaKeys()
+        # Started without a server: only downloads, saved queues and settings work.
+        self.offline = False
         self.running = True
         self.home_generation = 0
         self.return_home_refresh = False
@@ -485,7 +614,7 @@ class LibraryUI:
         self.direction = (0, 0)
         self.setup_page = None if config else {"kind": "setup", "selection": 0, "values": {"serverUrl": "", "username": "", "password": "", "quality": "480p"}}
         if config and config.get("password"):
-            self.start("Connecting to Jellyfin...", lambda: authenticate(config), self.connected)
+            self.start("Connecting to Jellyfin...", lambda: authenticate(config), self.connected, self.connect_failed)
         elif config:
             self.setup_page = {"kind": "setup", "selection": 2, "values": dict(config)}
 
@@ -498,12 +627,21 @@ class LibraryUI:
                                items=[], searched=False, layers=[[list("1234567890-="), list("qwertyuiop[]"), list("asdfghjkl;'\\"), list("zxcvbnm,./") + [" ", "←"]], [list("!@#$%^&*()_+"), list("QWERTYUIOP{}"), list('ASDFGHJKL:\"|'), list("ZXCVBNM<>?") + [" ", "←"]]]))
 
     def finish_input(self, page):
+        if page["target"] == "_new_folder":
+            # A name for the folder browser, not a setting: nothing is saved to the config.
+            self.pages.pop()
+            self.setup_page = None
+            self.make_folder(page["query"].strip())
+            return
         self.setup_page["values"][page["target"]] = page["query"].strip()
         self.pages.pop()
         if self.setup_page.get("return_settings"):
             self.save_config(self.setup_page["values"])
             self.config = self.setup_page["values"]
             self.setup_page = None
+            if page["target"] == "downloadPath" and self.pages and self.pages[-1]["kind"] == "storage":
+                # A typed folder is checked like a listed one, then any pending download starts.
+                self.choose_storage(self.config["downloadPath"])
 
     def begin_settings(self):
         self.pages.append(dict(kind="settings", selection=0, values=dict(self.config)))
@@ -521,12 +659,14 @@ class LibraryUI:
             page["values"]["screenOff"] = SCREEN_OFF_CHOICES[(choice + 1) % len(SCREEN_OFF_CHOICES)]
             self.config["screenOff"] = page["values"]["screenOff"]
         elif page["selection"] == 2:
-            self.begin_input("serverUrl", "Server URL")
+            self.open_downloads()
         elif page["selection"] == 3:
-            self.begin_input("username", "Username")
+            self.begin_input("serverUrl", "Server URL")
         elif page["selection"] == 4:
-            self.begin_input("password", "Password", True)
+            self.begin_input("username", "Username")
         elif page["selection"] == 5:
+            self.begin_input("password", "Password", True)
+        elif page["selection"] == 6:
             page["confirm_logout"] = True
         else:
             self.pages.pop()
@@ -548,7 +688,7 @@ class LibraryUI:
         self.save_config(values); self.config = values; self.setup_page = None
         self.start("Connecting to Jellyfin...", lambda: self.authenticate(values), self.connected)
 
-    def start(self, label, function, done):
+    def start(self, label, function, done, failed=None):
         if self.pending:
             self.jobs.cancel(self.pending)
         self.loading = label
@@ -562,6 +702,8 @@ class LibraryUI:
                         "ConnectTimeout": "server unreachable (check Wi-Fi, IP and port)",
                         "ReadTimeout": "server timed out"}.get(error, error)
                 self.status = "Could not load: " + str(hint) + ". Press X to retry."
+                if failed:
+                    failed(error)
             else:
                 self.status = ""
                 done(value)
@@ -569,26 +711,82 @@ class LibraryUI:
 
     def connected(self, credentials):
         token, user = credentials
+        self.offline = self.renderer.offline = False
         self.api = LibraryAPI(self.config, token, user, self.headers(token), self.verify)
-        if self.music:
-            self.music.stop()
-        self.music = MusicPlayer(self.api.stream_url, self.api.report_playing, token)
-        self.sessions = load_sessions(self.session_path)
-        self.session_text = json.dumps(self.sessions, sort_keys=True)
-        self.artwork = Artwork(self.api, os.path.join(os.path.dirname(os.environ.get(
-            "JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json")), "cache", "artwork"))
+        if self.config.get("lastUserId") != user:
+            # Remember the account so its downloads can be opened without a server.
+            self.config["lastUserId"] = user
+            self.save_config(self.config)
+        self.open_account(user, token)
         self.refresh()
 
+    def downloads_index(self, user):
+        """One downloads index per account, kept with the app data (not on the card)."""
+        account = hashlib.sha256((self.api.server + "\n" + user).encode()).hexdigest()[:12]
+        return os.path.join(DATA_DIR, "downloads-" + account + ".json")
+
+    def open_account(self, user, token):
+        """Downloads, music and artwork for this account. Reconnecting the same account
+        (e.g. coming back online) keeps them, so playing music is not interrupted."""
+        index = self.downloads_index(user)
+        if self.downloads and self.downloads.index_path == index:
+            if self.offline:
+                self.downloads.set_offline(True)
+            else:
+                self.downloads.connect(self.api.server, self.api.headers)
+        else:
+            if self.music:
+                self.music.stop()
+                self.music = None
+            if self.downloads:
+                self.downloads.close()
+            self.downloads = Downloads(index, self.api.server, self.api.headers, self.verify,
+                                       offline=self.offline)
+        if not self.music:
+            self.music = MusicPlayer(self.track_url, self.report_music, token)
+            self.sessions = load_sessions(self.session_path)
+            self.session_text = json.dumps(self.sessions, sort_keys=True)
+        self.artwork = Artwork(self.api, os.path.join(DATA_DIR, "cache", "artwork"))
+
+    def report_music(self, event, track, session_id, ticks, paused):
+        # Looked up on each report: after reconnecting, reports go to the new login.
+        return self.api.report_playing(event, track, session_id, ticks, paused)
+
+    def connect_failed(self, error):
+        """Can't reach the server: open what's on the device instead, if anything."""
+        if error in ("ConnectionError", "ConnectTimeout", "ReadTimeout", "Timeout"):
+            self.go_offline()
+
+    def go_offline(self):
+        user = (self.config or {}).get("lastUserId")
+        if not user or not self.config.get("serverUrl"):
+            return False  # never logged in on this device: nothing to show
+        self.offline = self.renderer.offline = True
+        self.api = OfflineLibrary(self.config, user, self.verify)
+        self.open_account(user, None)
+        self.pages = [p for p in self.pages if p["kind"] in ("player", "sessions", "downloads")]
+        downloaded = [dict(entry["parent"], _download=entry["id"]) for entry in self.downloads.listing()]
+        self.rows = Rows([{"title": "Downloads", "items": downloaded, "loaded": True,
+                           "empty": "Nothing downloaded yet: X to try the server again"}])
+        self.status = "Offline: showing your downloads"
+        LOG.info("Offline mode: %d downloads", len(downloaded))
+        return True
+
     def refresh(self):
-        if not self.api:
+        if not self.api or self.offline:
+            # Not connected yet, or X on the offline Home: try the server (again).
             if self.config:
-                self.start("Connecting to Jellyfin...", lambda: self.authenticate(self.config), self.connected)
+                self.start("Connecting to Jellyfin...", lambda: self.authenticate(self.config),
+                           self.connected, self.connect_failed)
             return
         self.home_generation += 1
         def ready(views):
             values = [{"title": "My Media", "items": views, "loaded": True},
                       {"title": "Next Up", "fetch": self.api.next_up, "empty": "You are all caught up"},
                       {"title": "Continue Watching", "fetch": self.api.resume, "empty": "No unfinished videos"}]
+            downloaded = [dict(entry["parent"], _download=entry["id"]) for entry in self.downloads.listing()]
+            if downloaded:
+                values.insert(1, {"title": "Downloads", "items": downloaded, "loaded": True})
             if any(view.get("CollectionType") == "music" for view in views):
                 values.append({"title": "Favourite Songs", "fetch": self.api.favourite_songs,
                                "empty": "Add favourites from Now Playing with R1"})
@@ -599,10 +797,14 @@ class LibraryUI:
         self.start("Loading My Media...", self.api.views, ready)
 
     def logout(self):
+        self.offline = self.renderer.offline = False
         if self.music:
             self.music.stop()
             self.save_music_session()
             self.music = None
+        if self.downloads:
+            self.downloads.close()
+            self.downloads = None
         self.api = self.artwork = None
         self.pages = []
         self.rows = Rows([])
@@ -633,6 +835,9 @@ class LibraryUI:
 
     def open_item(self, item, library=False):
         if not item:
+            return
+        if item.get("_download"):
+            self.play_download(item["_download"])
             return
         kind = item.get("Type", "")
         if library or item.get("IsFolder") or kind in ("Series", "Season", "Folder", "CollectionFolder", "UserView", "BoxSet"):
@@ -707,6 +912,176 @@ class LibraryUI:
             self.open_player()
         self.start("Preparing music...", work, ready)
 
+    def track_url(self, track):
+        """Downloaded tracks always play from the card, even when online."""
+        return (self.downloads and self.downloads.local_path(track["Id"])) or self.api.stream_url(track)
+
+    def play_download(self, collection_id):
+        entry = self.downloads.collections.get(collection_id)
+        if not entry or not entry["tracks"]:
+            return
+        key = tuple(track["Id"] for track in entry["tracks"])
+        saved = next((s for s in self.my_sessions() if queue_key(s) == key), None)
+        if saved:
+            self.resume_session(saved)  # audiobooks pick up where you left them
+        else:
+            self.save_music_session()
+            self.music.play(entry["tracks"], 0, entry["title"])
+            self.open_player()
+
+    def download_page(self, page):
+        """R1 on a music page: download the album/playlist it shows."""
+        parent = page["parent"]
+        if not self.config.get("downloadPath"):
+            self.open_storage(then=lambda: self.download_page(page))
+            return
+        def notice(text):
+            page["notice"] = (text, time.monotonic() + 4)
+        state = self.downloads.status(parent["Id"])
+        if state and state["state"] == "done":
+            notice("Already downloaded · manage in Settings → Downloads")
+            return
+        if state and state["state"] in ("downloading", "queued"):
+            notice("Already downloading")
+            return
+        folder = self.config["downloadPath"]
+        def ready(tracks):
+            if not tracks:
+                notice("No tracks to download here")
+                return
+            self.downloads.add(parent["Id"], parent.get("Name") or page["title"], parent, tracks, folder)
+            notice("Downloading %d tracks to %s" % (len(tracks), folder))
+            # Cache the covers now (album card on Home, each track in Now Playing),
+            # using the same item data the offline screens draw from.
+            entry = self.downloads.collections[parent["Id"]]
+            for item in [entry["parent"]] + entry["tracks"] if self.artwork else []:
+                self.artwork.get(item, (188, 113), True)
+        self.start("Preparing download...", lambda: self.api.album_tracks(parent), ready)
+
+    def open_downloads(self):
+        self.pages.append(dict(kind="downloads", selection=0, confirm=None))
+
+    def open_storage(self, then=None):
+        # The keyboard edits "values" in place, so the old location is kept apart for undo.
+        self.pages.append(dict(kind="storage", selection=0, choices=storage_choices(),
+                               values=dict(self.config), previous=self.config.get("downloadPath"), then=then))
+
+    def choose_storage(self, path):
+        """Use path for new downloads (existing ones stay playable where they are)."""
+        picker = next((p for p in reversed(self.pages) if p["kind"] == "storage"), {})
+        error = None
+        if path and not on_real_storage(path):
+            # e.g. /media/MEDIA while the card is not mounted: only RAM, lost at reboot.
+            error = "%s is in memory, not on a card. Is the card mounted?" % path
+        else:
+            try:
+                os.makedirs(path, exist_ok=True)
+                probe = os.path.join(path, ".jellyfin-write-test")
+                with open(probe, "w", encoding="ascii") as target:
+                    target.write("ok")
+                os.remove(probe)
+            except OSError as exc:
+                error = "Can't write to %s (%s)" % (path or "that folder", type(exc).__name__)
+        if error:
+            self.status = error
+            if picker and self.config.get("downloadPath") == path:
+                # A typed folder was already saved by the keyboard; put the old one back.
+                self.config["downloadPath"] = picker["previous"]
+                picker["values"]["downloadPath"] = picker["previous"]
+                self.save_config(self.config)
+            return
+        self.config["downloadPath"] = path
+        self.save_config(self.config)
+        # Close the picker and any folder browser opened from it.
+        while self.pages and self.pages[-1]["kind"] in ("storage", "folders"):
+            self.pages.pop()
+        page = picker
+        for other in self.pages:
+            if other["kind"] == "settings":
+                other["values"]["downloadPath"] = path
+        self.status = "Downloads go to " + path
+        if page.get("then"):
+            page["then"]()
+
+    def open_folders(self, path=None):
+        """Browse from path, or from the extra cards (/media), or /userdata."""
+        path = path or next((p for p in ("/media", "/userdata") if os.path.isdir(p)), "/")
+        dirs, error = list_folders(path)
+        self.pages.append(dict(kind="folders", path=path, dirs=dirs, error=error, selection=0, values={},
+                               memory=not on_real_storage(path)))
+
+    def enter_folder(self, page, path):
+        dirs, error = list_folders(path)
+        page.update(path=path, dirs=dirs, error=error, selection=0, memory=not on_real_storage(path))
+
+    def folders_activate(self, page):
+        kind, name = folder_rows(page)[page["selection"]]
+        if kind == "use":
+            self.choose_storage(page["path"])
+        elif kind == "new":
+            self.begin_input("_new_folder", "New folder name")
+        elif kind == "up":
+            self.enter_folder(page, os.path.dirname(page["path"].rstrip("/")) or "/")
+        else:
+            self.enter_folder(page, os.path.join(page["path"], name))
+
+    def make_folder(self, name):
+        page = self.pages[-1]
+        safe = safe_name(name, "")
+        if not safe:
+            page["error"] = "A folder needs a name"
+            return
+        path = os.path.join(page["path"], safe)
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            page["error"] = "Can't create %s (%s)" % (safe, type(exc).__name__)
+            return
+        self.enter_folder(page, path)  # open it, ready for "Use this folder"
+
+    def download_label(self, page):
+        """For a page of tracks: where its offline copy stands (None: not a music page)."""
+        if not self.downloads or not any(item.get("Type") == "Audio" for item in page["items"]):
+            return None
+        notice, until = page.get("notice") or ("", 0)
+        if time.monotonic() < until:
+            return notice
+        state = self.downloads.status(page["parent"].get("Id"))
+        if not state:
+            return ""
+        return {"done": "✓ Downloaded · %d tracks" % state["total"],
+                "downloading": "Downloading %d/%d" % (state["done"] + 1, state["total"]),
+                "queued": "Download queued",
+                "paused": state["error"],
+                "failed": "Download failed · retry in Settings → Downloads",
+                "incomplete": "Partly downloaded · %d/%d" % (state["done"], state["total"])}[state["state"]]
+
+    def downloads_activate(self, page):
+        entries = self.downloads.listing()
+        if page["selection"] == 0:
+            self.open_storage()
+        elif page["selection"] - 1 < len(entries):
+            self.play_download(entries[page["selection"] - 1]["id"])
+
+    def downloads_button(self, page, button):
+        """X removes (pressed twice), Y retries or resumes."""
+        entries = self.downloads.listing()
+        if not 0 < page["selection"] <= len(entries):
+            return
+        entry = entries[page["selection"] - 1]
+        if button == 6:
+            if page["confirm"] != page["selection"]:
+                page["confirm"] = page["selection"]
+                return
+            self.downloads.remove(entry["id"])
+            page["confirm"] = None
+            page["selection"] = min(page["selection"], len(entries) - 1)
+            self.status = "Removed " + entry["title"]
+        else:
+            # Also for "done" entries: retry re-fetches files missing from the card.
+            self.downloads.retry(entry["id"])
+            self.status = "Checking " + entry["title"]
+
     def open_player(self):
         self.status = ""
         if not (self.pages and self.pages[-1]["kind"] == "player"):
@@ -754,6 +1129,18 @@ class LibraryUI:
 
     def open_sessions(self):
         self.pages.append(dict(kind="sessions", selection=0, confirm=None))
+
+    def toggle_sessions(self):
+        """R2: Saved queues from anywhere (not while typing); R2 again closes them."""
+        if not self.api or not self.music or self.pending:
+            return
+        if self.pages and self.pages[-1]["kind"] in ("search", "input"):
+            return
+        if self.pages and self.pages[-1]["kind"] == "sessions":
+            self.pages.pop()
+            return
+        self.save_music_session()  # so the playing queue shows its current position
+        self.open_sessions()
 
     def remove_session(self, page):
         sessions = self.my_sessions()
@@ -913,6 +1300,20 @@ class LibraryUI:
                 page["selection"] = max(0, min(len(self.my_sessions()) - 1, page["selection"] - y))
                 page["confirm"] = None
             return
+        if page["kind"] == "downloads":
+            if y:
+                # Row 0 is the location; collections follow.
+                page["selection"] = max(0, min(len(self.downloads.listing()), page["selection"] - y))
+                page["confirm"] = None
+            return
+        if page["kind"] == "storage":
+            if y:  # the drives, then "Browse folders..." and "Type a folder..."
+                page["selection"] = max(0, min(len(page["choices"]) + 1, page["selection"] - y))
+            return
+        if page["kind"] == "folders":
+            if y:
+                page["selection"] = max(0, min(len(folder_rows(page)) - 1, page["selection"] - y))
+            return
         if page["kind"] == "player":
             options = page.get("options")
             if options:
@@ -945,7 +1346,7 @@ class LibraryUI:
                 page["key_x"] = min(page["key_x"], len(rows[page["key_y"]]) - 1)
             return
         if page["kind"] == "settings":
-            if y: page["selection"] = max(0, min(6, page["selection"] - y))
+            if y: page["selection"] = max(0, min(7, page["selection"] - y))
             return
         if page["kind"] == "detail" and page.get("options"):
             options = page["options"]
@@ -973,6 +1374,21 @@ class LibraryUI:
             sessions = self.my_sessions()
             if sessions:
                 self.resume_session(sessions[self.pages[-1]["selection"]])
+            return
+        if self.pages and self.pages[-1]["kind"] == "downloads":
+            self.downloads_activate(self.pages[-1])
+            return
+        if self.pages and self.pages[-1]["kind"] == "storage":
+            page = self.pages[-1]
+            if page["selection"] < len(page["choices"]):
+                self.choose_storage(page["choices"][page["selection"]]["path"])
+            elif page["selection"] == len(page["choices"]):
+                self.open_folders()
+            else:
+                self.begin_input("downloadPath", "Download folder")
+            return
+        if self.pages and self.pages[-1]["kind"] == "folders":
+            self.folders_activate(self.pages[-1])
             return
         if self.pages and self.pages[-1]["kind"] == "player":
             page = self.pages[-1]
@@ -1068,15 +1484,16 @@ class LibraryUI:
             if self.pages[-1]["kind"] == "input" and self.setup_page and self.setup_page.get("return_settings"):
                 self.setup_page = None
             self.pages.pop()
-            if not self.pages and self.return_home_refresh and not self.reporter:
+            # Offline, Home stays as is: reconnecting is X's job, not every Back press.
+            if not self.pages and self.return_home_refresh and not self.reporter and not self.offline:
                 self.return_home_refresh = False
                 self.refresh()
 
     def draw(self):
         playing = self.music.current if self.music and self.music.active else None
         self.renderer.now_playing = (playing or {}).get("Name", "")
-        self.renderer.music_hint = ("Music" if playing else
-                                    "Saved queues" if self.my_sessions() else "")
+        # R2 always opens Saved queues, so B only needs a hint while music plays.
+        self.renderer.music_hint = "Music" if playing else ""
         if not self.api:
             if self.pages and self.pages[-1]["kind"] == "input":
                 self.renderer.keyboard(self.pages[-1], bool(self.pending))
@@ -1096,8 +1513,17 @@ class LibraryUI:
         elif self.pages[-1]["kind"] == "sessions":
             playing = queue_key(self.music.session()) if self.music.active and self.music.queue else None
             self.renderer.sessions(self.pages[-1], self.my_sessions(), playing, self.status)
+        elif self.pages[-1]["kind"] == "downloads":
+            location = self.config.get("downloadPath")
+            self.renderer.downloads(self.pages[-1], self.downloads.listing(), location,
+                                    free_bytes(location) if location else 0, self.downloads.summary(), self.status)
+        elif self.pages[-1]["kind"] == "storage":
+            self.renderer.storage(self.pages[-1], self.pages[-1]["choices"], self.config.get("downloadPath"))
+        elif self.pages[-1]["kind"] == "folders":
+            self.renderer.folders(self.pages[-1], free_bytes(self.pages[-1]["path"]), self.status)
         elif self.pages[-1]["kind"] == "list":
             page = self.pages[-1]
+            page["download"] = self.download_label(page)
             self.renderer.listing(page, self.artwork, bool(self.pending))
             if page["paging"]:
                 self.renderer.spinner(606, 418, 7)
@@ -1155,8 +1581,16 @@ class LibraryUI:
                         continue
                     if self.pages and self.pages[-1]["kind"] == "player" and self.player_button(event.button):
                         continue
+                    if self.pages and self.pages[-1]["kind"] == "downloads" and event.button in (5, 6, 7):
+                        self.downloads_button(self.pages[-1], 6 if event.button == 6 else 5)
+                        continue
+                    if event.button == R2_BUTTON:
+                        self.toggle_sessions()
+                        continue
                     if event.button == 8 and not self.pages and self.api:
                         self.begin_settings()
+                    elif event.button == 8 and self.pages and self.pages[-1].get("download") is not None:
+                        self.download_page(self.pages[-1])
                     elif event.button in (9, 10, 11):
                         self.running = False
                     elif event.button == 4:
@@ -1201,6 +1635,12 @@ class LibraryUI:
                         self.player_button({pygame.K_x: 6, pygame.K_y: 5, pygame.K_o: 8}[event.key])
                     elif event.key == pygame.K_x and self.pages and self.pages[-1]["kind"] == "sessions":
                         self.remove_session(self.pages[-1])
+                    elif event.key in (pygame.K_x, pygame.K_y) and self.pages and self.pages[-1]["kind"] == "downloads":
+                        self.downloads_button(self.pages[-1], 6 if event.key == pygame.K_x else 5)
+                    elif event.key == pygame.K_o and self.pages and self.pages[-1].get("download") is not None:
+                        self.download_page(self.pages[-1])
+                    elif event.key == pygame.K_q:
+                        self.toggle_sessions()
                     elif event.key == pygame.K_y and not self.pages:
                         self.begin_search()
                     elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):

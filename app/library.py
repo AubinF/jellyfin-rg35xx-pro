@@ -194,6 +194,24 @@ class LibraryAPI:
                      if episode.get("IndexNumber") == index + 1), None)
 
 
+class OfflineLibrary:
+    """Stands in for LibraryAPI when the server can't be reached: same account
+    identity (for downloads, saved queues and cached artwork), but every server
+    call fails fast so the UI shows its normal error instead of hanging."""
+    def __init__(self, config, user_id, verify):
+        self.server = config["serverUrl"].rstrip("/")
+        self.user_id, self.token, self.headers, self.verify = user_id, "", {}, verify
+
+    def stream_url(self, item):
+        # Not reachable offline: mpv reports an error and the player skips the track.
+        return self.server + "/Audio/" + item["Id"] + "/stream?static=true"
+
+    def __getattr__(self, name):
+        def offline(*args, **kwargs):
+            raise requests.ConnectionError("offline")
+        return offline
+
+
 def image_candidates(item, landscape):
     """Use server library artwork and episode/series artwork like jellyfin-web."""
     identity = item.get("Id")

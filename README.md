@@ -52,6 +52,9 @@ For a later update, copy the new file and folder into the same place and allow y
 | Music options (R1) | Favourite the track, set a sleep timer (D-pad left/right changes it), open Saved queues, or turn the screen off |
 | Headset buttons | Play/pause, next and previous work from any screen, even with the screen off. A single-button wired remote works like a phone: press once to play/pause, twice for next, three times for previous. Play with nothing playing resumes the most recent saved queue |
 | Home | While music plays, **B** returns to Now Playing; otherwise **B** opens Saved queues |
+| Anywhere | **R2** opens Saved queues (press again to close) |
+| Offline | If the server can't be reached at startup, the app opens in offline mode: Home shows your Downloads, which play from the card, and Saved queues still work. **X** tries the server again; music keeps playing when it comes back. Needs one online launch first so the app knows your account |
+| Downloads | On an album, playlist or audiobook page, **R1** downloads it for offline listening. The first time, choose where to keep downloads (a second SD card, internal storage, or any folder: browse to it, create a new one, or type its path). Downloaded tracks always play from the card. **Settings → Downloads** shows progress and lets you play (**A**), retry (**Y**) or remove (**X** twice) |
 | Saved queues | Up to 10 queues (albums, playlists, audiobooks) keep their track and position. D-pad chooses, **A** resumes, **X** twice removes one, **B** goes back |
 | Volume | The handheld's volume buttons still control KNULLI volume |
 
