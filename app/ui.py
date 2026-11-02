@@ -743,9 +743,12 @@ class LibraryUI:
                             page["track_options"] = page["options"]
                         elif self.pages and self.pages[-1]["kind"] == "list":
                             page = self.pages[-1]
-                            if page["items"]:
+                            if self.status.startswith("Could not load more"):
+                                self.status = ""
+                                self.more(page)
+                            elif page["items"]:
                                 self.toggle_played(page["items"][page["selection"]])
-                        elif self.api:
+                        else:
                             self.refresh()
                     elif event.button in (5, 7):
                         if self.pages and self.pages[-1]["kind"] == "detail":
