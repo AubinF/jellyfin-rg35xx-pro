@@ -23,12 +23,14 @@ SAVED_FIELDS = ("Id", "Name", "Type", "Artists", "AlbumArtist", "Album", "AlbumI
 
 class Queue:
     """Play order over a fixed track list; toggling shuffle keeps the current track."""
-    def __init__(self, tracks, start=0):
+    def __init__(self, tracks, start=0, title=None):
         self.tracks = list(tracks)
         self.order = list(range(len(self.tracks)))
         self.position = max(0, min(start, len(self.tracks) - 1))
         self.shuffle = False
         self.repeat = "off"
+        # What the queue was started from (album, playlist, shelf), for the saved-queues list.
+        self.title = title
 
     @property
     def current(self):
@@ -79,7 +81,7 @@ class Queue:
     def snapshot(self):
         return {"tracks": [{key: track[key] for key in SAVED_FIELDS if key in track} for track in self.tracks],
                 "order": self.order, "position": self.position,
-                "shuffle": self.shuffle, "repeat": self.repeat}
+                "shuffle": self.shuffle, "repeat": self.repeat, "title": self.title}
 
     @classmethod
     def restore(cls, value):
@@ -92,31 +94,62 @@ class Queue:
             queue.jump(position)
         queue.shuffle = bool(value.get("shuffle"))
         queue.repeat = value.get("repeat") if value.get("repeat") in REPEAT_MODES else "off"
+        queue.title = value.get("title") if isinstance(value.get("title"), str) else None
         return queue
 
 
-def save_session(path, session):
-    """Atomically keep the last queue so it can be resumed after a restart."""
+SAVED_QUEUES = 10
+
+
+def queue_key(session):
+    """A saved queue is identified by its track list: replaying the same album or
+    audiobook updates its entry instead of adding another."""
+    return tuple(track.get("Id") for track in session.get("tracks", []))
+
+
+def remember_session(sessions, session, account, limit=SAVED_QUEUES):
+    """Put session (with its progress) first, replacing the entry for the same
+    track list; keep at most limit per account. Returns the new list."""
+    session = dict(session, **account)
+    key = queue_key(session)
+    mine = [s for s in sessions if all(s.get(k) == v for k, v in account.items())]
+    old = next((s for s in mine if queue_key(s) == key), None)
+    if mine and old is mine[0] and {k: v for k, v in old.items() if k != "played_at"} == session:
+        return sessions  # already first and unchanged: avoid rewriting the file
+    session["played_at"] = int(time.time())
+    dropped = [s for s in mine if s is not old][limit - 1:]
+    return [session] + [s for s in sessions if s is not old and not any(s is d for d in dropped)]
+
+
+def session_queue(session):
+    """The validated Queue a saved session describes (tolerates a corrupt file)."""
+    return Queue.restore(session)
+
+
+def forget_session(sessions, key, account):
+    return [s for s in sessions if not (queue_key(s) == key and all(s.get(k) == v for k, v in account.items()))]
+
+
+def save_sessions(path, sessions):
+    """Atomically keep the saved queues so they survive a restart."""
     try:
-        if session is None:
-            os.remove(path)
-            return
         with open(path + ".tmp", "w", encoding="utf-8") as target:
-            json.dump(session, target)
+            json.dump({"sessions": sessions}, target)
         os.replace(path + ".tmp", path)
-    except FileNotFoundError:
-        pass
     except OSError as exc:
-        LOG.warning("Could not save the music queue (%s)", type(exc).__name__)
+        LOG.warning("Could not save the music queues (%s)", type(exc).__name__)
 
 
-def load_session(path):
+def load_sessions(path):
     try:
         with open(path, encoding="utf-8") as source:
             value = json.load(source)
-        return value if isinstance(value, dict) and value.get("tracks") else None
     except (OSError, ValueError):
-        return None
+        return []
+    if isinstance(value, dict) and value.get("tracks"):
+        return [value]  # the earlier single-queue file
+    sessions = value.get("sessions") if isinstance(value, dict) else None
+    return [s for s in sessions if isinstance(s, dict) and s.get("tracks")] if isinstance(sessions, list) else []
 
 
 class MusicPlayer:
@@ -144,8 +177,10 @@ class MusicPlayer:
         self.sleep = 0
         self.sleep_at = None
         self.volume = 100
-        # What a restart can resume once playback stops; None after the queue finished.
+        # The final state when playback stops, for the UI to save; None after the queue finished.
         self.last_session = None
+        # A queue that played to the end, so the UI can drop it from the saved queues.
+        self.finished_session = None
 
     @property
     def active(self):
@@ -177,10 +212,10 @@ class MusicPlayer:
         value["elapsed"] = round(self.position()[0]) if self.started else 0
         return value
 
-    def play(self, tracks, start=0):
+    def play(self, tracks, start=0, title=None):
         if not tracks:
             return
-        queue = Queue(tracks, start)
+        queue = Queue(tracks, start, title)
         if self.queue:
             # A new album keeps the listener's shuffle/repeat choice.
             queue.repeat = self.queue.repeat
@@ -405,7 +440,10 @@ class MusicPlayer:
     def stop(self, keep_session=True):
         """Stop and reap mpv. Returns the last track's reporter so callers can wait on it."""
         if self.queue:
-            self.last_session = self.session() if keep_session else None
+            snapshot = self.session()
+            self.last_session = snapshot if keep_session else None
+            if not keep_session:
+                self.finished_session = snapshot
         reporter = self.reporter
         self._finish_track()
         if self.player:

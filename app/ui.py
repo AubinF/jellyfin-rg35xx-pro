@@ -8,7 +8,8 @@ import time
 import pygame
 
 from library import Artwork, Jobs, LibraryAPI, Rows
-from music import MusicPlayer, load_session, save_session
+from music import (SAVED_QUEUES, MusicPlayer, forget_session, load_sessions, queue_key,
+                   remember_session, save_sessions, session_queue)
 from playback import Backlight, MediaKeys
 
 MEDIA_KEYS = {getattr(pygame, name) for name in ("K_AUDIOPLAY", "K_AUDIOSTOP", "K_AUDIONEXT", "K_AUDIOPREV",
@@ -384,8 +385,8 @@ class Renderer:
         if options:
             favourite = (track.get("UserData") or {}).get("IsFavorite")
             rows = [("Favourite", "♥ Yes" if favourite else "No"), ("Sleep timer", sleep_label(music)),
-                    ("Screen", "Turn off now")]
-            pygame.draw.rect(self.screen, (30, 32, 41), (120, 150, 400, 162), border_radius=8)
+                    ("Saved queues", "Switch to another queue"), ("Screen", "Turn off now")]
+            pygame.draw.rect(self.screen, (30, 32, 41), (120, 150, 400, 196), border_radius=8)
             self.text("Music options", 140, 164, 360, self.heading)
             for index, (label, value) in enumerate(rows):
                 y = 202 + index * 34
@@ -394,6 +395,34 @@ class Renderer:
                 self.text(label, 148, y, 130, self.font, TEXT)
                 self.text(value, 290, y + 2, 206, self.small, TEXT)
             self.footer("▲ ▼  Choose     A  Change     ◀ ▶  Sleep time     B  Close")
+
+    def sessions(self, page, sessions, playing_key, status=""):
+        self.header(False)
+        self.text("Saved queues", 18, 79, 200, self.heading)
+        message = "Press X again to remove it" if page.get("confirm") is not None else status
+        self.text(message or "%d of %d kept" % (len(sessions), SAVED_QUEUES), 222, 84, 400, self.small,
+                  ACCENT if message else MUTED, right=True)
+        if not sessions:
+            self.text("Nothing saved yet", 18, 230, 604, self.heading, MUTED, center=True)
+        today = time.localtime()
+        for index, session in enumerate(sessions[:SAVED_QUEUES]):
+            queue = session_queue(session)
+            track = queue.current or {}
+            y, selected = 114 + index * 31, index == page["selection"]
+            if selected:
+                pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 28), border_radius=4)
+            playing = queue_key(session) == playing_key
+            title = session.get("title") or track.get("Album") or track.get("Name") or "Queue"
+            self.text(("▶ " if playing else "") + title, 28, y + 4, 214, self.font,
+                      TEXT if selected or not playing else ACCENT)
+            # The chapter you are on matters most for audiobooks.
+            where = "%d/%d  %s · %s" % (queue.position + 1, len(queue.order), track.get("Name") or "",
+                                        clock(session.get("elapsed") or 0))
+            self.text(where, 250, y + 6, 238, self.small, TEXT if selected else MUTED)
+            played = time.localtime(session.get("played_at") or 0)
+            when = ("Today" if played[:3] == today[:3] else time.strftime("%d %b", played))
+            self.text(when, 496, y + 6, 116, self.small, TEXT if selected else MUTED, right=True)
+        self.footer("▲ ▼  Choose     A  Resume     X  Remove     B  Back")
 
     def queue_view(self, page, music):
         queue = music.queue
@@ -439,6 +468,8 @@ class LibraryUI:
         self.reporter = None
         self.music = None
         self.session_path = os.path.join(DATA_DIR, "music-queue.json")
+        # Saved queues for every account on this device, most recently played first.
+        self.sessions = []
         self.session_text = None
         self.session_save_at = 0
         self.backlight = Backlight()
@@ -542,10 +573,8 @@ class LibraryUI:
         if self.music:
             self.music.stop()
         self.music = MusicPlayer(self.api.stream_url, self.api.report_playing, token)
-        session = load_session(self.session_path)
-        # Only offer a saved queue to the account and server that played it.
-        if session and session.get("server") == self.api.server and session.get("user") == user:
-            self.music.last_session = session
+        self.sessions = load_sessions(self.session_path)
+        self.session_text = json.dumps(self.sessions, sort_keys=True)
         self.artwork = Artwork(self.api, os.path.join(os.path.dirname(os.environ.get(
             "JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json")), "cache", "artwork"))
         self.refresh()
@@ -620,7 +649,8 @@ class LibraryUI:
                 self.play_music(item, parent=source["parent"])
             elif not self.pages:
                 # A home shelf such as Favourite Songs plays as its own queue.
-                self.play_music(item, tracks=self.rows.values[self.rows.row].get("items"))
+                row = self.rows.values[self.rows.row]
+                self.play_music(item, tracks=row.get("items"), title=row.get("title"))
             else:
                 self.play_music(item)
         else:
@@ -657,14 +687,23 @@ class LibraryUI:
             self.pages[-1]["item"] = item
         return item
 
-    def play_music(self, item, parent=None, tracks=None):
+    def play_music(self, item, parent=None, tracks=None, title=None):
         """Queue the album/playlist parent (or given tracks) starting at item; just item otherwise."""
         def work():
             queue = self.api.album_tracks(parent) if parent else [t for t in tracks or [] if t.get("Type") == "Audio"]
             ids = [track.get("Id") for track in queue]
             return (queue, ids.index(item["Id"])) if item.get("Id") in ids else ([item], 0)
         def ready(result):
-            self.music.play(*result)
+            queue, start = result
+            key = tuple(track.get("Id") for track in queue)
+            saved = next((s for s in self.my_sessions() if queue_key(s) == key), None)
+            if saved and (session_queue(saved).current or {}).get("Id") == item.get("Id"):
+                # Picking the chapter you were on resumes mid-chapter (audiobooks);
+                # any other track starts there.
+                self.resume_session(saved)
+                return
+            self.save_music_session()
+            self.music.play(queue, start, title or (parent or {}).get("Name") or item.get("Name"))
             self.open_player()
         self.start("Preparing music...", work, ready)
 
@@ -673,18 +712,64 @@ class LibraryUI:
         if not (self.pages and self.pages[-1]["kind"] == "player"):
             self.pages.append(dict(kind="player", view="now", selection=0, options=None))
 
+    def account(self):
+        return {"server": self.api.server, "user": self.api.user_id}
+
+    def my_sessions(self):
+        """Saved queues of the signed-in account only, most recently played first."""
+        if not self.api:
+            return []
+        account = self.account()
+        return [s for s in self.sessions if all(s.get(k) == v for k, v in account.items())]
+
     def save_music_session(self):
-        """Persist the queue only when it changed; position is kept to the nearest 10 s."""
+        """Fold the playing queue's progress into the saved queues and write the
+        file only when something changed; position is kept to the nearest 10 s."""
         if not self.music or not self.api:
             return
+        if self.music.finished_session:
+            # Played to the end (an audiobook finished): nothing left to resume.
+            self.sessions = forget_session(self.sessions, queue_key(self.music.finished_session), self.account())
+            self.music.finished_session = None
         session = self.music.session()
+        if not self.music.active:
+            self.music.last_session = None  # consumed; a removed entry must not come back
         if session:
-            session = dict(session, server=self.api.server, user=self.api.user_id,
-                           elapsed=int(session.get("elapsed") or 0) // 10 * 10)
-        text = json.dumps(session, sort_keys=True)
+            session = dict(session, elapsed=int(session.get("elapsed") or 0) // 10 * 10)
+            self.sessions = remember_session(self.sessions, session, self.account())
+        text = json.dumps(self.sessions, sort_keys=True)
         if text != self.session_text:
-            save_session(self.session_path, session)
+            save_sessions(self.session_path, self.sessions)
             self.session_text = text
+
+    def resume_session(self, session):
+        # Save the queue being left first, so swapping books never loses its place.
+        self.save_music_session()
+        self.music.resume(session)
+        if self.pages and self.pages[-1]["kind"] == "sessions":
+            self.pages.pop()
+        self.open_player()
+        if self.pages[-1].get("view"):
+            self.pages[-1]["view"] = "now"
+
+    def open_sessions(self):
+        self.pages.append(dict(kind="sessions", selection=0, confirm=None))
+
+    def remove_session(self, page):
+        sessions = self.my_sessions()
+        if not sessions:
+            return
+        session = sessions[page["selection"]]
+        if self.music.active and self.music.queue and queue_key(session) == queue_key(self.music.session()):
+            self.status = "This queue is playing; it can't be removed"
+            return
+        if page["confirm"] != page["selection"]:
+            page["confirm"] = page["selection"]
+            return
+        self.sessions = forget_session(self.sessions, queue_key(session), self.account())
+        page["confirm"] = None
+        page["selection"] = max(0, min(page["selection"], len(self.my_sessions()) - 1))
+        self.save_music_session()
 
     def toggle_favourite(self, track):
         favourite = not (track.get("UserData") or {}).get("IsFavorite")
@@ -697,10 +782,9 @@ class LibraryUI:
         if not self.music or self.pending:
             return
         if not self.music.active:
-            # Like a phone: play on the headset picks up the last queue.
-            if action in ("play", "playpause") and self.music.last_session:
-                self.music.resume(self.music.last_session)
-                self.open_player()
+            # Like a phone: play on the headset picks up the most recent queue.
+            if action in ("play", "playpause") and self.my_sessions():
+                self.resume_session(self.my_sessions()[0])
             return
         if (action == "playpause" or (action == "play" and self.music.paused)
                 or (action == "pause" and not self.music.paused)):
@@ -824,11 +908,16 @@ class LibraryUI:
             self.rows.move(x, y)
             return
         page = self.pages[-1]
+        if page["kind"] == "sessions":
+            if y:
+                page["selection"] = max(0, min(len(self.my_sessions()) - 1, page["selection"] - y))
+                page["confirm"] = None
+            return
         if page["kind"] == "player":
             options = page.get("options")
             if options:
                 if y:
-                    options["row"] = max(0, min(2, options["row"] - y))
+                    options["row"] = max(0, min(3, options["row"] - y))
                 elif x and not repeat and options["row"] == 1:
                     self.music.cycle_sleep(x)
             elif page["view"] == "queue":
@@ -880,6 +969,11 @@ class LibraryUI:
             self.setup_activate(); return
         if self.pages and self.pages[-1]["kind"] == "settings":
             self.settings_activate(); return
+        if self.pages and self.pages[-1]["kind"] == "sessions":
+            sessions = self.my_sessions()
+            if sessions:
+                self.resume_session(sessions[self.pages[-1]["selection"]])
+            return
         if self.pages and self.pages[-1]["kind"] == "player":
             page = self.pages[-1]
             options = page.get("options")
@@ -888,6 +982,10 @@ class LibraryUI:
                     self.toggle_favourite(self.music.current)
                 elif options["row"] == 1:
                     self.music.cycle_sleep(1)
+                elif options["row"] == 2:
+                    page["options"] = None
+                    self.save_music_session()  # so the list shows the current position
+                    self.open_sessions()
                 else:
                     page["options"] = None
                     self.go_dark()
@@ -964,9 +1062,8 @@ class LibraryUI:
             self.pages[-1]["view"] = "now"
         elif not self.pages and self.music and self.music.active:
             self.open_player()
-        elif not self.pages and self.music and self.music.last_session:
-            self.music.resume(self.music.last_session)
-            self.open_player()
+        elif not self.pages and self.my_sessions():
+            self.open_sessions()
         elif self.pages:
             if self.pages[-1]["kind"] == "input" and self.setup_page and self.setup_page.get("return_settings"):
                 self.setup_page = None
@@ -979,7 +1076,7 @@ class LibraryUI:
         playing = self.music.current if self.music and self.music.active else None
         self.renderer.now_playing = (playing or {}).get("Name", "")
         self.renderer.music_hint = ("Music" if playing else
-                                    "Resume music" if self.music and self.music.last_session else "")
+                                    "Saved queues" if self.my_sessions() else "")
         if not self.api:
             if self.pages and self.pages[-1]["kind"] == "input":
                 self.renderer.keyboard(self.pages[-1], bool(self.pending))
@@ -996,6 +1093,9 @@ class LibraryUI:
             self.renderer.settings(self.pages[-1])
         elif self.pages[-1]["kind"] == "player":
             self.renderer.player(self.pages[-1], self.music, self.artwork, self.status)
+        elif self.pages[-1]["kind"] == "sessions":
+            playing = queue_key(self.music.session()) if self.music.active and self.music.queue else None
+            self.renderer.sessions(self.pages[-1], self.my_sessions(), playing, self.status)
         elif self.pages[-1]["kind"] == "list":
             page = self.pages[-1]
             self.renderer.listing(page, self.artwork, bool(self.pending))
@@ -1065,7 +1165,9 @@ class LibraryUI:
                         self.activate()
                         break
                     elif event.button == 6:
-                        if self.pages and self.pages[-1]["kind"] == "detail":
+                        if self.pages and self.pages[-1]["kind"] == "sessions":
+                            self.remove_session(self.pages[-1])
+                        elif self.pages and self.pages[-1]["kind"] == "detail":
                             page = self.pages[-1]
                             page["options"] = page.get("track_options") or self.options_for(page["item"])
                             page["track_options"] = page["options"]
@@ -1097,6 +1199,8 @@ class LibraryUI:
                             page["layer"] = (page["layer"] + 1) % len(page["layers"])
                     elif event.key in (pygame.K_x, pygame.K_y, pygame.K_o) and self.pages and self.pages[-1]["kind"] == "player":
                         self.player_button({pygame.K_x: 6, pygame.K_y: 5, pygame.K_o: 8}[event.key])
+                    elif event.key == pygame.K_x and self.pages and self.pages[-1]["kind"] == "sessions":
+                        self.remove_session(self.pages[-1])
                     elif event.key == pygame.K_y and not self.pages:
                         self.begin_search()
                     elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):

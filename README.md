@@ -49,9 +49,10 @@ For a later update, copy the new file and folder into the same place and allow y
 | Audio and subtitles | **X** cycles audio tracks; **Y** cycles subtitle tracks (including Off) |
 | Music | **A** pauses; D-pad left/right seeks 10 seconds; up/down changes track; **X** shows the queue; **Y** shuffles; **R1** opens Music options; **B** returns to the library while music keeps playing |
 | Music queue | D-pad chooses, **A** plays the chosen track, **Y** shuffles, **X** cycles repeat (off / all / one), **B** closes |
-| Music options (R1) | Favourite the track, set a sleep timer (D-pad left/right changes it), or turn the screen off |
-| Headset buttons | Play/pause, next and previous work from any screen, even with the screen off. A single-button wired remote works like a phone: press once to play/pause, twice for next, three times for previous. Play with nothing playing resumes the last queue |
-| Home while music plays | **B** returns to Now Playing; after a stop or restart, **B** resumes the last queue where you left it |
+| Music options (R1) | Favourite the track, set a sleep timer (D-pad left/right changes it), open Saved queues, or turn the screen off |
+| Headset buttons | Play/pause, next and previous work from any screen, even with the screen off. A single-button wired remote works like a phone: press once to play/pause, twice for next, three times for previous. Play with nothing playing resumes the most recent saved queue |
+| Home | While music plays, **B** returns to Now Playing; otherwise **B** opens Saved queues |
+| Saved queues | Up to 10 queues (albums, playlists, audiobooks) keep their track and position. D-pad chooses, **A** resumes, **X** twice removes one, **B** goes back |
 | Volume | The handheld's volume buttons still control KNULLI volume |
 
 Selecting a song in an album or playlist queues the whole list and plays it gaplessly. While music plays, the screen turns off after a period without input (30 seconds by default, change it under **Settings → Music screen off**). Any button turns it back on; that press does nothing else.

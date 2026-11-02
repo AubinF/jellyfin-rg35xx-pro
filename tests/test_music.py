@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 from unittest.mock import patch
 
 import playback
-from music import MusicPlayer, Queue, load_session, save_session
+from music import (MusicPlayer, Queue, forget_session, load_sessions, queue_key,
+                   remember_session, save_sessions)
 from playback import Backlight
 
 
@@ -72,13 +73,55 @@ class QueueTests(unittest.TestCase):
         self.assertEqual([t["Id"] for t in restored.upcoming()], ["0", "1", "2"])
         self.assertEqual((restored.position, restored.repeat), (0, "off"))
 
-    def test_session_file_save_load_and_clear(self):
+    def test_session_file_round_trip_and_old_single_queue_format(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "queue.json")
-            save_session(path, {"tracks": [{"Id": "1"}]})
-            self.assertEqual(load_session(path), {"tracks": [{"Id": "1"}]})
-            save_session(path, None)
-            self.assertIsNone(load_session(path))
+            self.assertEqual(load_sessions(path), [])
+            save_sessions(path, [{"tracks": [{"Id": "1"}]}])
+            self.assertEqual(load_sessions(path), [{"tracks": [{"Id": "1"}]}])
+            # The earlier build stored one queue as a bare object.
+            Path(path).write_text(json.dumps({"tracks": [{"Id": "9"}], "position": 0}))
+            self.assertEqual([queue_key(s) for s in load_sessions(path)], [("9",)])
+            Path(path).write_text("not json")
+            self.assertEqual(load_sessions(path), [])
+
+
+class SavedQueuesTests(unittest.TestCase):
+    ME = {"server": "http://jf", "user": "me"}
+
+    def book(self, name, position=0, elapsed=0):
+        return {"tracks": [{"Id": name + str(i)} for i in range(3)], "order": [0, 1, 2],
+                "position": position, "elapsed": elapsed, "title": name}
+
+    def test_same_track_list_updates_its_entry_and_moves_first(self):
+        sessions = remember_session([], self.book("a"), self.ME)
+        sessions = remember_session(sessions, self.book("b"), self.ME)
+        sessions = remember_session(sessions, self.book("a", position=2, elapsed=90), self.ME)
+        self.assertEqual([(s["title"], s["position"]) for s in sessions], [("a", 2), ("b", 0)])
+
+    def test_unchanged_first_queue_is_left_alone_but_a_resumed_one_moves_first(self):
+        sessions = remember_session([], self.book("a"), self.ME)
+        sessions = remember_session(sessions, self.book("b"), self.ME)
+        self.assertIs(remember_session(sessions, self.book("b"), self.ME), sessions)
+        # Resuming "a" with no new progress still makes it the most recent.
+        sessions = remember_session(sessions, self.book("a"), self.ME)
+        self.assertEqual([s["title"] for s in sessions], ["a", "b"])
+
+    def test_keeps_ten_per_account_and_leaves_other_accounts_alone(self):
+        other = dict(self.book("theirs"), server="http://jf", user="them")
+        sessions = [other]
+        for index in range(12):
+            sessions = remember_session(sessions, self.book("b%d" % index), self.ME)
+        mine = [s["title"] for s in sessions if s["user"] == "me"]
+        self.assertEqual(mine, ["b%d" % i for i in range(11, 1, -1)])
+        self.assertIn(other, sessions)
+
+    def test_forget_removes_only_that_queue_for_this_account(self):
+        sessions = remember_session([], self.book("a"), self.ME)
+        sessions = remember_session(sessions, self.book("b"), self.ME)
+        theirs = remember_session([], self.book("a"), {"server": "http://jf", "user": "them"})
+        sessions = forget_session(sessions + theirs, queue_key(self.book("a")), self.ME)
+        self.assertEqual([(s["title"], s["user"]) for s in sessions], [("b", "me"), ("a", "them")])
 
 
 class BacklightTests(unittest.TestCase):
@@ -183,6 +226,9 @@ class MusicPlayerTests(unittest.TestCase):
         self.player.play([{"Id": "0"}, {"Id": "1"}, {"Id": "2"}], start=1)
         self.assertTrue(self.run_until(lambda: not self.player.active))
         self.assertEqual(self.player.status, "Finished playing the queue")
+        # A finished queue is reported so the saved queues can drop it.
+        self.assertIsNone(self.player.last_session)
+        self.assertEqual(queue_key(self.player.finished_session), ("0", "1", "2"))
         time.sleep(0.2)
         with self.lock:
             started = [track for event, track in self.reports if event == "started"]

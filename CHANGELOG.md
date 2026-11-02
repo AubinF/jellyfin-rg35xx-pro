@@ -9,7 +9,7 @@
 - Queue view to see and jump to any track, plus shuffle and repeat (off / all / one).
 - Albums list in track order and playlists keep their own order.
 - Gapless playback: the next track is lined up and pre-buffered so albums flow without a pause.
-- The last queue is saved on the device; **B** on Home resumes it at the same track and position, even after a restart.
+- Saved queues: up to 10 queues (albums, playlists, audiobooks) keep their own track and position on the device, even after a restart. Switch between them from **B** on Home or **R1** → Saved queues; picking the chapter you were on in the library resumes mid-chapter. Finished queues leave the list.
 - Favourites: mark the playing track from Music options; a Favourite Songs row appears on Home for music libraries.
 - Sleep timer (15–90 minutes or end of track) that fades the music out.
 - Screen turns off during music playback after a configurable idle time (Settings → Music screen off). On the RG35XX H this sets the panel brightness to 0 through the Allwinner `/dev/disp` driver (KNULLI has no `/sys/class/backlight` there); the launcher restores the brightness on exit.
