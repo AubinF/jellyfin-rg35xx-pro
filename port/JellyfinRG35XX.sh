@@ -52,5 +52,5 @@ cleanup() {
 }
 trap cleanup EXIT
 $GPTOKEYB "jellyfin_rg35xx.py" &
-pm_platform_helper "$GAMEDIR/jellyfin_rg35xx.py"
+command -v pm_platform_helper >/dev/null && pm_platform_helper "$GAMEDIR/jellyfin_rg35xx.py"
 python3 ./jellyfin_rg35xx.py

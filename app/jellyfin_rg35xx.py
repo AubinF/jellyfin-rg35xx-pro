@@ -7,13 +7,28 @@ from playback import ControllerInput, PlaybackReporter, PlaybackSession
 BUILD = "2.1.3"
 CONFIG = os.environ.get("JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json")
 CONFIG_KEY = CONFIG + ".key"
-CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+def _ca_bundle():
+    # A missing hard-coded bundle makes every request fail on non-KNULLI firmware.
+    for path in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"):
+        if os.path.exists(path):
+            return path
+    try:
+        import certifi
+        return certifi.where()
+    except Exception:
+        return True
+
+CA_BUNDLE = _ca_bundle()
 LOG = logging.getLogger("jellyfin")
 
 def normalize_server_url(value):
     value = str(value or "").strip().rstrip("/")
     if value and not value.lower().startswith(("http://", "https://")):
-        value = "https://" + value
+        host = value.split("/")[0].rsplit("@", 1)[-1]
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        local = name.replace(".", "").isdigit() or name.endswith(".local") or "." not in name
+        # Bare LAN addresses and explicit ports are normally plain-HTTP Jellyfin servers.
+        value = ("http://" if local or ":8096" in host else "https://") + value
     return value
 
 def authorization_value(token=None):
@@ -193,16 +208,16 @@ def prepare_playback(config, token, user_id, item, audio_index=None, subtitle_in
                 url = config["serverUrl"].rstrip("/") + "/Videos/" + item_id + "/stream?static=true&ApiKey=" + token
             else:
                 play_method = "Transcode"
-    except Exception:
-        pass
+    except Exception as exc:
+        LOG.warning("Transcode setup failed (%s: %s); using direct stream", type(exc).__name__, exc)
     ipc_path = "/tmp/jellyfin-mpv-" + session_id + ".sock"
     try: os.unlink(ipc_path)
     except FileNotFoundError: pass
-    mpv_args = ["mpv", "--fullscreen", "--force-window=yes", "--really-quiet",
+    mpv_args = ["mpv", "--fullscreen", "--force-window=yes", "--msg-level=all=v", "--log-file=" + os.path.join(os.path.dirname(CONFIG), "mpv-log.txt"),
                 "--input-terminal=no", "--input-default-bindings=no", "--input-vo-keyboard=no",
                 "--osd-font=DejaVu Sans", "--osd-font-size=22",
                 "--input-ipc-server=" + ipc_path, "--hwdec=auto-safe", "--framedrop=vo", "--cache=yes",
-                "--http-header-fields=Authorization: " + authorization_value(token),
+                "--http-header-fields=X-Emby-Token: " + token,
                 "--cache-pause=no", "--video-sync=audio", "--audio-buffer=1",
                 "--cache-secs=30", "--demuxer-max-bytes=128MiB", "--demuxer-max-back-bytes=64MiB"]
     if resume_seconds > 3: mpv_args.append("--start=" + str(resume_seconds))
@@ -230,7 +245,7 @@ def play_item(config, token, user_id, item, prepared=None):
         item["_PlaybackCompleted"] = session.completed
         status = "Saving progress..."
     except Exception as exc:
-        LOG.error("Playback failed (%s)", type(exc).__name__)
+        LOG.exception("Playback failed (%s)", type(exc).__name__)
         status = "Playback closed safely. Please try again."
     finally:
         if controls:

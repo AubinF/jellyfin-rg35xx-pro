@@ -389,7 +389,12 @@ class LibraryUI:
             self.pending = None
             self.loading = ""
             if error:
-                self.status = "Could not load. Check the connection and press X to retry."
+                hint = {"HTTPError": "login/server rejected (check user, password, URL)",
+                        "SSLError": "HTTPS certificate problem (try http:// and the server port)",
+                        "ConnectionError": "server unreachable (check Wi-Fi, IP and port)",
+                        "ConnectTimeout": "server unreachable (check Wi-Fi, IP and port)",
+                        "ReadTimeout": "server timed out"}.get(error, error)
+                self.status = "Could not load: " + str(hint) + ". Press X to retry."
             else:
                 self.status = ""
                 done(value)

@@ -87,6 +87,9 @@ class MpvIPC:
                 del self.outgoing[:sent]
             except BlockingIOError:
                 pass
+            except (BrokenPipeError, ConnectionResetError):
+                self.eof = True
+                return
         # Bound work per frame so even a flood of events cannot starve controls.
         for _ in range(32):
             try:
@@ -151,6 +154,20 @@ class InputDecoder:
         return actions
 
 
+def is_gamepad(name, name_path):
+    """Other RG35XX models name their pad differently; accept any device with face buttons."""
+    if any(word in name.lower() for word in ("keyboard", "mouse", "touch", "power", "headset", "lid")):
+        return False
+    try:
+        with open(os.path.join(os.path.dirname(name_path), "capabilities", "key"), encoding="utf-8") as source:
+            words = [int(word, 16) for word in source.read().split()]
+    except (OSError, ValueError):
+        return False
+    bits = sum(word << (64 * index) for index, word in enumerate(reversed(words)))
+    # BTN_SOUTH (304) and BTN_EAST (305) are the A/B buttons.
+    return bool(bits >> 304 & 1 and bits >> 305 & 1)
+
+
 class ControllerInput:
     def __init__(self):
         self.devices = {}
@@ -159,7 +176,7 @@ class ControllerInput:
             try:
                 with open(name_path, encoding="utf-8") as source:
                     name = source.read().strip()
-                if name != "Anbernic RG35XX-H Controller":
+                if not (name == "Anbernic RG35XX-H Controller" or is_gamepad(name, name_path)):
                     continue
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                 self.devices[fd] = InputDecoder()
@@ -275,10 +292,14 @@ class PlaybackSession:
             if self.guard and sys.platform.startswith("linux"):
                 args = [sys.executable, os.path.abspath(__file__), "--guard-parent",
                         str(os.getpid())] + args
+            try:
+                errlog = open(os.path.join(os.path.dirname(os.environ.get("JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json")), "mpv-stderr.txt"), "wb")
+            except OSError:
+                errlog = subprocess.DEVNULL
             self.player = subprocess.Popen(args, start_new_session=True,
                                            stdin=subprocess.DEVNULL,
-                                           stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL)
+                                           stdout=errlog,
+                                           stderr=errlog)
             LOG.info("Player started pid=%d", self.player.pid)
             connect_deadline = time.monotonic() + 8
             load_deadline = time.monotonic() + 45
