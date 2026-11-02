@@ -9,8 +9,10 @@ import pygame
 
 from library import Artwork, Jobs, LibraryAPI, Rows
 from music import MusicPlayer, load_session, save_session
-from playback import Backlight
+from playback import Backlight, MediaKeys
 
+MEDIA_KEYS = {getattr(pygame, name) for name in ("K_AUDIOPLAY", "K_AUDIOSTOP", "K_AUDIONEXT", "K_AUDIOPREV",
+                                                 "K_AUDIOPAUSE", "K_MEDIASELECT", "K_UNKNOWN") if hasattr(pygame, name)}
 DATA_DIR = os.path.dirname(os.environ.get("JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json"))
 
 BG = (16, 16, 20)
@@ -444,6 +446,7 @@ class LibraryUI:
         atexit.register(self.backlight.turn_on)
         self.dark = False
         self.last_input = time.monotonic()
+        self.media_keys = MediaKeys()
         self.running = True
         self.home_generation = 0
         self.return_home_refresh = False
@@ -688,6 +691,24 @@ class LibraryUI:
         def done(value):
             self.status = "Added to favourites" if favourite else "Removed from favourites"
         self.start("Saving favourite...", lambda: self.api.set_favourite(track, favourite), done)
+
+    def media_action(self, action):
+        """Headset buttons drive the music from any screen, even with it turned off."""
+        if not self.music or self.pending:
+            return
+        if not self.music.active:
+            # Like a phone: play on the headset picks up the last queue.
+            if action in ("play", "playpause") and self.music.last_session:
+                self.music.resume(self.music.last_session)
+                self.open_player()
+            return
+        if (action == "playpause" or (action == "play" and self.music.paused)
+                or (action == "pause" and not self.music.paused)):
+            self.music.toggle_pause()
+        elif action == "next":
+            self.music.next()
+        elif action == "previous":
+            self.music.previous()
 
     def go_dark(self):
         self.dark = True
@@ -1009,7 +1030,13 @@ class LibraryUI:
                 if was_active != self.music.active or time.monotonic() >= self.session_save_at:
                     self.save_music_session()
                     self.session_save_at = time.monotonic() + 5
+            for action in self.media_keys.poll():
+                self.media_action(action)
             for event in pygame.event.get():
+                if event.type == pygame.KEYDOWN and event.key in MEDIA_KEYS:
+                    # SDL may see headset buttons as keys too; MediaKeys already handled
+                    # them, and they must not wake the screen in a pocket.
+                    continue
                 if (event.type in (pygame.JOYBUTTONDOWN, pygame.KEYDOWN)
                         or (event.type == pygame.JOYHATMOTION and event.value != (0, 0))):
                     self.last_input = time.monotonic()
@@ -1089,6 +1116,7 @@ class LibraryUI:
             pygame.display.flip()
             clock.tick(30)
         self.backlight.turn_on()
+        self.media_keys.close()
         reporters = [self.reporter, self.music.stop() if self.music else None]
         self.save_music_session()
         deadline = time.monotonic() + 25

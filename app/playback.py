@@ -162,16 +162,21 @@ class InputDecoder:
         return actions
 
 
+def key_bits(device_dir):
+    """The EV_KEY capability bitmap sysfs publishes for an input device, as an int."""
+    try:
+        with open(os.path.join(device_dir, "capabilities", "key"), encoding="utf-8") as source:
+            words = [int(word, 16) for word in source.read().split()]
+    except (OSError, ValueError):
+        return 0
+    return sum(word << (64 * index) for index, word in enumerate(reversed(words)))
+
+
 def is_gamepad(name, name_path):
     """Other RG35XX models name their pad differently; accept any device with face buttons."""
     if any(word in name.lower() for word in ("keyboard", "mouse", "touch", "power", "headset", "lid")):
         return False
-    try:
-        with open(os.path.join(os.path.dirname(name_path), "capabilities", "key"), encoding="utf-8") as source:
-            words = [int(word, 16) for word in source.read().split()]
-    except (OSError, ValueError):
-        return False
-    bits = sum(word << (64 * index) for index, word in enumerate(reversed(words)))
+    bits = key_bits(os.path.dirname(name_path))
     # BTN_SOUTH (304) and BTN_EAST (305) are the A/B buttons.
     return bool(bits >> 304 & 1 and bits >> 305 & 1)
 
@@ -210,6 +215,90 @@ class ControllerInput:
 
     def close(self):
         for fd in self.devices:
+            os.close(fd)
+        self.devices.clear()
+
+
+class MediaKeys:
+    """Headset and Bluetooth (AVRCP) media buttons, read straight from evdev.
+
+    Any input device that can send a media key is used; Bluetooth headphones
+    appear and disappear, so devices are rescanned every few seconds. A wired
+    single-button remote sends KEY_MEDIA (the "hook"): like phones, one press
+    is play/pause, two are next, three are previous.
+    """
+    KEYS = {164: "playpause", 200: "play", 201: "pause", 166: "pause",  # PLAYPAUSE, PLAYCD, PAUSECD, STOPCD
+            163: "next", 165: "previous", 226: "hook"}                # NEXTSONG, PREVIOUSSONG, MEDIA
+    CLICKS = {1: "playpause", 2: "next", 3: "previous"}
+    CLICK_GAP = 0.45
+
+    def __init__(self, input_root="/dev/input", sys_root="/sys/class/input", rescan=3):
+        self.input_root, self.sys_root, self.rescan = input_root, sys_root, rescan
+        self.devices = {}  # fd -> (path, unread bytes)
+        self.rescan_at = 0
+        self.clicks, self.click_at = 0, 0
+
+    def _scan(self):
+        known = {path for path, _ in self.devices.values()}
+        for path in sorted(glob.glob(os.path.join(self.input_root, "event*"))):
+            if path in known:
+                continue
+            device_dir = os.path.join(self.sys_root, os.path.basename(path), "device")
+            bits = key_bits(device_dir)
+            if not any(bits >> code & 1 for code in self.KEYS):
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            self.devices[fd] = (path, bytearray())
+            try:
+                with open(os.path.join(device_dir, "name"), encoding="utf-8") as source:
+                    name = source.read().strip()
+            except OSError:
+                name = "?"
+            LOG.info("Media keys ready: %s (%s)", name, path)
+
+    def _drop(self, fd):
+        path, _ = self.devices.pop(fd)
+        os.close(fd)
+        LOG.info("Media keys gone: %s", path)
+
+    def poll(self):
+        now = time.monotonic()
+        if now >= self.rescan_at:
+            self._scan()
+            self.rescan_at = now + self.rescan
+        actions = []
+        ready, _, _ = select.select(list(self.devices), [], [], 0) if self.devices else ([], [], [])
+        for fd in ready:
+            try:
+                data = os.read(fd, InputDecoder.EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            except OSError:
+                data = b""  # ENODEV: the Bluetooth device disconnected
+            if not data:
+                self._drop(fd)
+                continue
+            buffer = self.devices[fd][1]
+            buffer.extend(data)
+            while len(buffer) >= InputDecoder.EVENT.size:
+                _, _, kind, code, value = InputDecoder.EVENT.unpack_from(buffer)
+                del buffer[:InputDecoder.EVENT.size]
+                if kind != 1 or value != 1 or code not in self.KEYS:
+                    continue
+                if self.KEYS[code] == "hook":
+                    self.clicks, self.click_at = min(self.clicks + 1, 3), now
+                else:
+                    actions.append(self.KEYS[code])
+        if self.clicks and now - self.click_at > self.CLICK_GAP:
+            actions.append(self.CLICKS[self.clicks])
+            self.clicks = 0
+        return actions
+
+    def close(self):
+        for fd in list(self.devices):
             os.close(fd)
         self.devices.clear()
 

@@ -13,6 +13,7 @@
 - Favourites: mark the playing track from Music options; a Favourite Songs row appears on Home for music libraries.
 - Sleep timer (15–90 minutes or end of track) that fades the music out.
 - Screen turns off during music playback after a configurable idle time (Settings → Music screen off). On the RG35XX H this sets the panel brightness to 0 through the Allwinner `/dev/disp` driver (KNULLI has no `/sys/class/backlight` there); the launcher restores the brightness on exit.
+- Headset media buttons (wired remotes and Bluetooth AVRCP headphones) control music from any screen without waking it; single-button remotes use 1/2/3 presses for play-pause/next/previous.
 
 ### Fixed
 

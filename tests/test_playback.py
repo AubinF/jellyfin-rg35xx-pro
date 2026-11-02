@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
-from playback import (InputDecoder, JsonLines, MpvIPC, PlaybackReporter,
+from playback import (InputDecoder, JsonLines, MediaKeys, MpvIPC, PlaybackReporter,
                       PlaybackSession)
 
 
@@ -206,3 +206,78 @@ class CleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MediaKeysTests(unittest.TestCase):
+    """Fake evdev devices: a FIFO per event node plus its sysfs capability file."""
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.inputs = Path(self.root.name) / "input"
+        self.sys = Path(self.root.name) / "sys"
+        self.inputs.mkdir()
+        self.writers = []
+
+    def tearDown(self):
+        for writer in self.writers:
+            os.close(writer)
+        self.root.cleanup()
+
+    def device(self, name, codes):
+        node = self.inputs / name
+        os.mkfifo(node)
+        info = self.sys / name / "device"
+        (info / "capabilities").mkdir(parents=True)
+        (info / "name").write_text("Test " + name)
+        bits = sum(1 << code for code in codes)
+        (info / "capabilities" / "key").write_text("%x" % bits)
+        return node
+
+    def keys(self):
+        return MediaKeys(str(self.inputs), str(self.sys), rescan=0)
+
+    def connect(self, node):
+        writer = os.open(node, os.O_WRONLY | os.O_NONBLOCK)
+        self.writers.append(writer)
+        return writer
+
+    def press(self, writer, code):
+        os.write(writer, InputDecoder.EVENT.pack(0, 0, 1, code, 1) + InputDecoder.EVENT.pack(0, 0, 1, code, 0))
+
+    def test_dedicated_keys_and_devices_without_media_keys_are_ignored(self):
+        headset = self.device("event0", [163, 164, 165])
+        self.device("event1", [304, 305])  # a gamepad: not opened
+        keys = self.keys()
+        keys.poll()
+        writer = self.connect(headset)
+        self.assertEqual(len(keys.devices), 1)
+        for code in (164, 163, 165, 200):
+            self.press(writer, code)
+        self.assertEqual(keys.poll(), ["playpause", "next", "previous", "play"])
+        keys.close()
+
+    def test_single_button_remote_counts_presses_like_a_phone(self):
+        remote = self.device("event2", [226])
+        keys = self.keys()
+        keys.poll()
+        writer = self.connect(remote)
+        results = []
+        for presses in (1, 2, 3):
+            for _ in range(presses):
+                self.press(writer, 226)
+            self.assertEqual(keys.poll(), [])
+            time.sleep(MediaKeys.CLICK_GAP + 0.05)
+            results += keys.poll()
+        self.assertEqual(results, ["playpause", "next", "previous"])
+        keys.close()
+
+    def test_disconnected_device_is_dropped_and_found_again(self):
+        node = self.device("event3", [164])
+        keys = self.keys()
+        keys.poll()
+        os.close(self.connect(node))
+        self.writers.clear()
+        keys.poll()  # EOF, like a Bluetooth headset going away
+        self.assertEqual(keys.devices, {})
+        keys.poll()  # the rescan opens it again
+        self.assertEqual(len(keys.devices), 1)
+        keys.close()

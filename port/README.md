@@ -23,6 +23,7 @@ Credentials are encrypted on the device using a device-local key. Never share th
 - Video seeking: D-pad left/right skips 10 seconds; L1/R1 skips 30 seconds; L2/R2 skips 60 seconds.
 - Audio and subtitles: **X** cycles audio tracks; **Y** cycles subtitle tracks, including Off.
 - Music: **A** pauses; D-pad left/right seeks; up/down changes track; **X** shows the queue (there **X** cycles repeat); **Y** shuffles; **R1** opens Music options (favourite, sleep timer, screen off); **B** returns to the library while music keeps playing.
+- Headset (wired or Bluetooth): play/pause, next and previous control the music from any screen, even with the screen off. Single-button remotes: 1 press play/pause, 2 next, 3 previous.
 - Home: **B** returns to Now Playing, or resumes the last queue after a stop or restart.
 - The screen turns off while music plays without input (Settings → Music screen off); any button wakes it.
 - Volume buttons remain controlled by KNULLI.

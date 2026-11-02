@@ -50,6 +50,7 @@ For a later update, copy the new file and folder into the same place and allow y
 | Music | **A** pauses; D-pad left/right seeks 10 seconds; up/down changes track; **X** shows the queue; **Y** shuffles; **R1** opens Music options; **B** returns to the library while music keeps playing |
 | Music queue | D-pad chooses, **A** plays the chosen track, **Y** shuffles, **X** cycles repeat (off / all / one), **B** closes |
 | Music options (R1) | Favourite the track, set a sleep timer (D-pad left/right changes it), or turn the screen off |
+| Headset buttons | Play/pause, next and previous work from any screen, even with the screen off. A single-button wired remote works like a phone: press once to play/pause, twice for next, three times for previous. Play with nothing playing resumes the last queue |
 | Home while music plays | **B** returns to Now Playing; after a stop or restart, **B** resumes the last queue where you left it |
 | Volume | The handheld's volume buttons still control KNULLI volume |
 
