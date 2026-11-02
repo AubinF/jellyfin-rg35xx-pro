@@ -1,15 +1,19 @@
 """640x480 controller UI with Jellyfin home shelves and asynchronous artwork."""
 import atexit
+import glob
 import hashlib
 import json
 import logging
 import math
 import os
+import random
 import time
+import uuid
 
 import pygame
 
-from downloads import Downloads, free_bytes, on_real_storage, safe_name, storage_choices
+from downloads import (SPACE_MARGIN, VIDEO_TYPES, Downloads, OfflineProgress, free_bytes, next_episodes,
+                       on_real_storage, safe_name, storage_choices, video_plan)
 from library import Artwork, Jobs, LibraryAPI, OfflineLibrary, Rows
 from music import (SAVED_QUEUES, MusicPlayer, forget_session, load_sessions, queue_key,
                    remember_session, save_sessions, session_queue)
@@ -19,6 +23,8 @@ from playback import Backlight, MediaKeys
 # button probe on the Pro: SDL numbers there are the evdev order shifted by 3
 # (A=3, B=4, R1=8, Select/Start/Menu=9/10/11, L1=7, L2=13, R2=14).
 R2_BUTTON = 14
+# Followed shows keep this many upcoming unwatched episodes on the card.
+NEXT_EPISODES = 3
 MEDIA_KEYS = {getattr(pygame, name) for name in ("K_AUDIOPLAY", "K_AUDIOSTOP", "K_AUDIONEXT", "K_AUDIOPREV",
                                                  "K_AUDIOPAUSE", "K_MEDIASELECT", "K_UNKNOWN") if hasattr(pygame, name)}
 LOG = logging.getLogger("jellyfin.ui")
@@ -95,6 +101,27 @@ class Renderer:
         self.now_playing = ""
         self.music_hint = ""
         self.offline = False
+        self.battery_state, self.battery_read = (None, False), -60.0
+
+    def battery(self):
+        """(percent, charging) from the power supply class, read at most every 30 s;
+        (None, False) where there is no battery (desktop)."""
+        if time.monotonic() - self.battery_read < 30:
+            return self.battery_state
+        self.battery_read, state = time.monotonic(), (None, False)
+        for supply in sorted(glob.glob("/sys/class/power_supply/*")):
+            try:
+                if open(os.path.join(supply, "type")).read().strip() != "Battery":
+                    continue
+                level = int(open(os.path.join(supply, "capacity")).read().strip())
+                status = open(os.path.join(supply, "status")).read().strip() if os.path.exists(
+                    os.path.join(supply, "status")) else ""
+                state = (max(0, min(100, level)), status in ("Charging", "Full"))
+                break
+            except (OSError, ValueError):
+                continue
+        self.battery_state = state
+        return state
 
     def text(self, value, x, y, width, font=None, color=TEXT, center=False, right=False):
         font = font or self.font
@@ -135,12 +162,18 @@ class Renderer:
         self.text("Home" if home else "Library", 222, 24, 130, self.font, TEXT)
         pygame.draw.rect(self.screen, ACCENT, (222, 57, 48 if home else 62, 3), border_radius=1)
         if self.now_playing:
-            self.text(("Offline · ♪ " if self.offline else "♪ ") + self.now_playing, 380, 24, 170, self.small, ACCENT)
+            self.text(("Offline · ♪ " if self.offline else "♪ ") + self.now_playing, 366, 24, 140, self.small, ACCENT)
         elif self.offline:
-            self.text("Offline", 418, 24, 121, self.small, ACCENT)
-        else:
-            self.text("RG35XX H", 418, 24, 121, self.small, MUTED)
-        self.text(self.build, 560, 24, 62, self.small, MUTED)
+            self.text("Offline", 366, 24, 140, self.small, ACCENT)
+        level, charging = self.battery()
+        if level is not None:
+            # A small battery outline, filled to the level (red when low).
+            pygame.draw.rect(self.screen, MUTED, (514, 26, 24, 13), 1, border_radius=2)
+            pygame.draw.rect(self.screen, MUTED, (538, 29, 2, 7))
+            colour = (220, 80, 70) if level <= 15 and not charging else (ACCENT if charging else TEXT)
+            pygame.draw.rect(self.screen, colour, (516, 28, max(1, round(20 * level / 100)), 9))
+            self.text(("⚡" if charging else "") + "%d%%" % level, 452, 24, 58, self.small, MUTED, right=True)
+        self.text(time.strftime("%H:%M"), 550, 24, 72, self.small, TEXT, right=True)
         pygame.draw.line(self.screen, (43, 44, 52), (18, 63), (622, 63))
 
     def footer(self, message):
@@ -284,19 +317,23 @@ class Renderer:
 
     def settings(self, page):
         self.header(False)
-        self.text("Settings", 18, 84, 604, self.heading)
+        self.text("Settings", 18, 84, 300, self.heading)
+        # The version used to sit in the header, where the clock is now.
+        self.text("Version " + self.build, 322, 89, 300, self.small, MUTED, right=True)
         values = page["values"]
         fields = [("Quality", values.get("quality", "480p")),
                   ("Music screen off", screen_off_label(values.get("screenOff", 30))),
                   ("Downloads", values.get("downloadPath") or "Choose where to keep them"),
+                  ("Video downloads", "Original files (large)" if values.get("videoDownloads") == "original"
+                   else "Converted to " + values.get("quality", "480p") + " (small)"),
                   ("Server URL", values.get("serverUrl", "")),
                   ("Username", values.get("username", "")), ("Password", "Saved"), ("Logout", "Forget saved login"), ("Back", "Return home")]
         for index, (label, value) in enumerate(fields):
-            y = 122 + index * 39
+            y = 120 + index * 35
             selected = index == page["selection"]
-            pygame.draw.rect(self.screen, ACCENT if selected else PANEL, (18, y, 604, 33), border_radius=5)
-            self.text(label, 31, y + 7, 170, self.font, TEXT)
-            self.text(value or "Not set", 210, y + 7, 392, self.font, TEXT if value else MUTED)
+            pygame.draw.rect(self.screen, ACCENT if selected else PANEL, (18, y, 604, 31), border_radius=5)
+            self.text(label, 31, y + 6, 170, self.font, TEXT)
+            self.text(value or "Not set", 210, y + 6, 392, self.font, TEXT if value else MUTED)
         self.footer("D-pad  Choose     A  Edit     B  Back     Start  Exit")
         if page.get("confirm_logout"):
             pygame.draw.rect(self.screen, (30, 32, 41), (82, 184, 476, 112), border_radius=8)
@@ -317,6 +354,10 @@ class Renderer:
         self.text(counter, 510, 83, 112, self.small, MUTED)
         if not items and not loading:
             self.text("No items in this folder", 70, 220, 500, self.heading, MUTED, center=True)
+        if page.get("tracklist"):
+            # Albums, playlists, audiobooks: a track list fits 9 per screen, cards only 6.
+            self.track_rows(page)
+            items = []
         for offset, item in enumerate(items[first:first + capacity]):
             if portrait:
                 rect = pygame.Rect(18 + offset * 155, 121, 140, 262)
@@ -328,9 +369,33 @@ class Renderer:
         if page.get("download") is not None:
             # A music page: show where its offline copy stands instead of Watched.
             self.text(page["download"], 306, 420, 316, self.small, ACCENT, right=True)
-            self.footer("D-pad  Browse     A  Play     R1  Download     Y  Search     B  Back     Start  Exit")
+            if page.get("tracklist"):
+                self.footer("D-pad  Browse    A  Play    X  Shuffle all    R1  Download    Y  Search    B  Back")
+            else:
+                self.footer("D-pad  Browse     A  Open     R1  Download     Y  Search     B  Back     Start  Exit")
         else:
             self.footer("D-pad  Browse     A  Open     X  Watched     Y  Search     B  Back     Start  Exit")
+
+    def track_rows(self, page):
+        items, selected = page["items"], page["selection"]
+        rows = 9
+        first = max(0, min(selected - rows // 2, len(items) - rows))
+        on_card, playing = page.get("on_card", set()), page.get("playing")
+        for offset, track in enumerate(items[first:first + rows]):
+            index, y = first + offset, 112 + offset * 33
+            is_selected = index == selected
+            if is_selected:
+                pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 30), border_radius=4)
+            muted = TEXT if is_selected else MUTED
+            number = "▶" if track.get("Id") == playing else str(track.get("IndexNumber") or index + 1)
+            self.text(number, 24, y + 6, 36, self.small, TEXT if is_selected or track.get("Id") == playing else MUTED,
+                      center=True)
+            self.text(track.get("Name") or "Untitled", 66, y + 5, 330, self.font, TEXT)
+            self.text(", ".join(track.get("Artists") or []), 404, y + 7, 130, self.small, muted)
+            if track.get("RunTimeTicks"):
+                self.text(clock(track["RunTimeTicks"] / 10000000), 536, y + 7, 52, self.small, muted, right=True)
+            if track.get("Id") in on_card:
+                self.text("✓", 594, y + 6, 22, self.small, TEXT if is_selected else ACCENT, center=True)
 
     def downloads(self, page, entries, location, free, summary, status=""):
         self.header(False)
@@ -352,17 +417,34 @@ class Renderer:
                     self.text(size_label(free) + " free", 482, y + 7, 130, self.small, muted, right=True)
                 continue
             self.text(entry["title"], 28, y + 5, 300, self.font, TEXT)
-            state = {"done": "✓ %d tracks" % entry["total"],
+            kind = (entry.get("tracks") or [{}])[0].get("Type")
+            noun = {"Audio": "tracks", "Episode": "episodes"}.get(kind, "videos")
+            state = {"done": ("✓ %d %s" % (entry["total"], noun)) if entry["total"] > 1 else "✓ Downloaded",
                      "downloading": "%d/%d · %d%%" % (entry["done"] + 1, entry["total"], entry["progress"] * 100),
                      "queued": "Queued · %d/%d" % (entry["done"], entry["total"]),
                      "paused": "Paused · %d/%d" % (entry["done"], entry["total"]),
                      "failed": "Failed · %d/%d · Y retry" % (entry["done"], entry["total"]),
-                     "incomplete": "%d/%d · Y resume" % (entry["done"], entry["total"])}[entry["state"]]
+                     "incomplete": "%d/%d · Y resume" % (entry["done"], entry["total"]),
+                     "missing": "%d missing · Y get again" % entry["missing"]}[entry["state"]]
             self.text(state, 336, y + 7, 180, self.small, TEXT if selected else (ACCENT if entry["state"] == "downloading" else MUTED))
             self.text(size_label(entry["size"]), 516, y + 7, 96, self.small, muted, right=True)
         if not entries:
             self.text("Open an album, playlist or audiobook and press R1", 18, 250, 604, self.font, MUTED, center=True)
         self.footer("▲ ▼  Choose     A  Play / Change     X  Remove     Y  Retry     B  Back")
+
+    def choice(self, choice):
+        """A small question over the current screen (e.g. which episodes to download)."""
+        options = choice["options"]
+        height = 58 + len(options) * 34
+        top = max(70, 250 - height // 2)
+        pygame.draw.rect(self.screen, (30, 32, 41), (100, top, 440, height), border_radius=8)
+        self.text(choice["title"], 120, top + 14, 400, self.heading)
+        for index, (label, _) in enumerate(options):
+            y = top + 50 + index * 34
+            if index == choice["row"]:
+                pygame.draw.rect(self.screen, ACCENT, (114, y - 4, 412, 28), border_radius=4)
+            self.text(label, 128, y, 390, self.font, TEXT)
+        self.footer("▲ ▼  Choose     A  Select     B  Cancel")
 
     def storage(self, page, choices, current):
         self.header(False)
@@ -410,7 +492,7 @@ class Renderer:
             self.text(status, 18, 418, 604, self.small, MUTED)
         self.footer("▲ ▼  Choose     A  Open / Use     B  Back")
 
-    def detail(self, item, artwork, status, options=None):
+    def detail(self, item, artwork, status, options=None, downloadable=False):
         self.header(False)
         self.card(item, pygame.Rect(18, 110, 144, 240), artwork, False, False, False)
         self.wrap(item.get("SeriesName") or item.get("Name", "Untitled"), 185, 82, 434, 2, self.heading, TEXT)
@@ -428,8 +510,11 @@ class Renderer:
             self.text("A   " + label, 195, 371, 192, self.font, TEXT, center=True)
         else:
             self.text("This media type is not playable yet", 185, 370, 429, self.small, MUTED)
-        self.text(status, 18, 414, 600, self.small, MUTED)
-        self.footer("A  Play / Resume     X  Play options     Y  Watched     B  Back     Start  Exit")
+        self.text(status, 18, 414, 600, self.small, ACCENT if status.startswith(("✓", "Downloading")) else MUTED)
+        if downloadable:
+            self.footer("A  Play / Resume    X  Play options    Y  Watched    R1  Download    B  Back")
+        else:
+            self.footer("A  Play / Resume     X  Play options     Y  Watched     B  Back     Start  Exit")
         if options:
             pygame.draw.rect(self.screen, (30, 32, 41), (174, 268, 452, 150), border_radius=8)
             self.text("Play options", 192, 282, 400, self.heading)
@@ -522,7 +607,7 @@ class Renderer:
                 self.text(value, 290, y + 2, 206, self.small, TEXT)
             self.footer("▲ ▼  Choose     A  Change     ◀ ▶  Sleep time     B  Close")
 
-    def sessions(self, page, sessions, playing_key, status=""):
+    def sessions(self, page, sessions, playing_key, status="", local=(), offline=False):
         self.header(False)
         self.text("Saved queues", 18, 79, 200, self.heading)
         message = "Press X again to remove it" if page.get("confirm") is not None else status
@@ -538,17 +623,23 @@ class Renderer:
             if selected:
                 pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 28), border_radius=4)
             playing = queue_key(session) == playing_key
+            have, total = local[index] if index < len(local) else (0, len(queue.order))
+            # Offline, a queue with nothing on the device can't play: shown greyed out.
+            unavailable = offline and not have
             title = session.get("title") or track.get("Album") or track.get("Name") or "Queue"
             self.text(("▶ " if playing else "") + title, 28, y + 4, 214, self.font,
-                      TEXT if selected or not playing else ACCENT)
+                      MUTED if unavailable and not selected else (TEXT if selected or not playing else ACCENT))
             # The chapter you are on matters most for audiobooks.
             where = "%d/%d  %s · %s" % (queue.position + 1, len(queue.order), track.get("Name") or "",
                                         clock(session.get("elapsed") or 0))
             self.text(where, 250, y + 6, 238, self.small, TEXT if selected else MUTED)
-            played = time.localtime(session.get("played_at") or 0)
-            when = ("Today" if played[:3] == today[:3] else time.strftime("%d %b", played))
-            self.text(when, 496, y + 6, 116, self.small, TEXT if selected else MUTED, right=True)
-        self.footer("▲ ▼  Choose     A  Resume     X  Remove     B  Back")
+            if have:
+                when = "✓ on device" if have == total else "%d/%d on device" % (have, total)
+            else:
+                played = time.localtime(session.get("played_at") or 0)
+                when = ("Today" if played[:3] == today[:3] else time.strftime("%d %b", played))
+            self.text(when, 496, y + 6, 116, self.small, TEXT if selected else (ACCENT if have else MUTED), right=True)
+        self.footer("▲ ▼  Choose     A  Resume     Y  Download     X  Remove     B  Back")
 
     def queue_view(self, page, music):
         queue = music.queue
@@ -579,6 +670,10 @@ class LibraryUI:
         self.joysticks = [pygame.joystick.Joystick(i) for i in range(pygame.joystick.get_count())]
         for joystick in self.joysticks:
             joystick.init()
+        # Y is SDL button 5, but on some KNULLI input profiles 7. On the RG35XX Pro 7 is L1,
+        # so treating it as Y there made L1 search, mark watched and shuffle.
+        names = [joystick.get_name() for joystick in self.joysticks]
+        self.y_buttons = (5,) if any("RG35XX-Pro" in name for name in names) else (5, 7)
         self.screen = pygame.display.set_mode((640, 480))
         self.renderer = Renderer(self.screen, build)
         self.config, self.authenticate, self.play_item = config, authenticate, play_item
@@ -594,6 +689,9 @@ class LibraryUI:
         self.reporter = None
         self.music = None
         self.downloads = None
+        self.progress = None  # plays recorded offline, synced when back online
+        self.status_after_load = ""  # a message to show once the current loading finishes
+        self.choice = None  # an open question (see ask()); it takes the D-pad, A and B
         self.session_path = os.path.join(DATA_DIR, "music-queue.json")
         # Saved queues for every account on this device, most recently played first.
         self.sessions = []
@@ -653,6 +751,7 @@ class LibraryUI:
             return
         if page["selection"] == 0:
             page["values"]["quality"] = {"480p": "720p", "720p": "1080p", "1080p": "360p", "360p": "480p"}.get(page["values"].get("quality"), "480p")
+            self.config["quality"] = page["values"]["quality"]  # used by new downloads right away
         elif page["selection"] == 1:
             current = page["values"].get("screenOff", 30)
             choice = SCREEN_OFF_CHOICES.index(current) if current in SCREEN_OFF_CHOICES else -1
@@ -661,12 +760,15 @@ class LibraryUI:
         elif page["selection"] == 2:
             self.open_downloads()
         elif page["selection"] == 3:
-            self.begin_input("serverUrl", "Server URL")
+            mode = "converted" if page["values"].get("videoDownloads") == "original" else "original"
+            page["values"]["videoDownloads"] = self.config["videoDownloads"] = mode
         elif page["selection"] == 4:
-            self.begin_input("username", "Username")
+            self.begin_input("serverUrl", "Server URL")
         elif page["selection"] == 5:
-            self.begin_input("password", "Password", True)
+            self.begin_input("username", "Username")
         elif page["selection"] == 6:
+            self.begin_input("password", "Password", True)
+        elif page["selection"] == 7:
             page["confirm_logout"] = True
         else:
             self.pages.pop()
@@ -705,7 +807,7 @@ class LibraryUI:
                 if failed:
                     failed(error)
             else:
-                self.status = ""
+                self.status, self.status_after_load = self.status_after_load, ""
                 done(value)
         self.pending = self.jobs.submit(function, completed)
 
@@ -718,6 +820,7 @@ class LibraryUI:
             self.config["lastUserId"] = user
             self.save_config(self.config)
         self.open_account(user, token)
+        self.sync_progress()
         self.refresh()
 
     def downloads_index(self, user):
@@ -729,6 +832,7 @@ class LibraryUI:
         """Downloads, music and artwork for this account. Reconnecting the same account
         (e.g. coming back online) keeps them, so playing music is not interrupted."""
         index = self.downloads_index(user)
+        self.progress = OfflineProgress(index.replace("downloads-", "offline-progress-"))
         if self.downloads and self.downloads.index_path == index:
             if self.offline:
                 self.downloads.set_offline(True)
@@ -743,12 +847,18 @@ class LibraryUI:
             self.downloads = Downloads(index, self.api.server, self.api.headers, self.verify,
                                        offline=self.offline)
         if not self.music:
-            self.music = MusicPlayer(self.track_url, self.report_music, token)
+            self.music = MusicPlayer(self.track_url, self.report_music, token, playable=self.track_playable,
+                                     log_path=os.path.join(DATA_DIR, "mpv-music.log"))
             self.sessions = load_sessions(self.session_path)
             self.session_text = json.dumps(self.sessions, sort_keys=True)
         self.artwork = Artwork(self.api, os.path.join(DATA_DIR, "cache", "artwork"))
 
     def report_music(self, event, track, session_id, ticks, paused):
+        if self.offline:
+            # Kept on the device; a track counts as played once 90% of it was heard.
+            if event == "stopped":
+                self.progress.record(track, ticks, ticks >= 0.9 * (track.get("RunTimeTicks") or 1e18))
+            return None
         # Looked up on each report: after reconnecting, reports go to the new login.
         return self.api.report_playing(event, track, session_id, ticks, paused)
 
@@ -788,11 +898,19 @@ class LibraryUI:
             if downloaded:
                 values.insert(1, {"title": "Downloads", "items": downloaded, "loaded": True})
             if any(view.get("CollectionType") == "music" for view in views):
+                # A recent track plays its album from there, not just this row of tracks.
+                values.append({"title": "Recently Played", "fetch": self.api.recently_played,
+                               "album_queue": True, "empty": "Nothing played yet"})
                 values.append({"title": "Favourite Songs", "fetch": self.api.favourite_songs,
                                "empty": "Add favourites from Now Playing with R1"})
             for view in views:
-                values.append({"title": "Recently Added in " + view.get("Name", "Library"),
-                               "fetch": lambda parent=view["Id"]: self.api.latest(parent)})
+                if view.get("CollectionType") == "music":
+                    # Music libraries hold albums, which the films/episodes row never showed.
+                    values.append({"title": "Latest albums in " + view.get("Name", "Music"),
+                                   "fetch": lambda parent=view["Id"]: self.api.latest(parent, "MusicAlbum")})
+                else:
+                    values.append({"title": "Recently Added in " + view.get("Name", "Library"),
+                                   "fetch": lambda parent=view["Id"]: self.api.latest(parent)})
             self.rows = Rows(values)
         self.start("Loading My Media...", self.api.views, ready)
 
@@ -837,7 +955,7 @@ class LibraryUI:
         if not item:
             return
         if item.get("_download"):
-            self.play_download(item["_download"])
+            self.open_download(item["_download"])
             return
         kind = item.get("Type", "")
         if library or item.get("IsFolder") or kind in ("Series", "Season", "Folder", "CollectionFolder", "UserView", "BoxSet"):
@@ -855,9 +973,17 @@ class LibraryUI:
             elif not self.pages:
                 # A home shelf such as Favourite Songs plays as its own queue.
                 row = self.rows.values[self.rows.row]
-                self.play_music(item, tracks=row.get("items"), title=row.get("title"))
+                if row.get("album_queue") and item.get("AlbumId"):
+                    self.play_music(item, parent={"Id": item["AlbumId"], "Type": "MusicAlbum",
+                                                  "Name": item.get("Album")})
+                else:
+                    self.play_music(item, tracks=row.get("items"), title=row.get("title"))
             else:
                 self.play_music(item)
+        elif self.offline or (self.pages and self.pages[-1].get("offline_collection")):
+            # A downloaded episode: its details come from the downloads index, no server needed.
+            self.pages.append(dict(kind="detail", item=self.with_offline_position(dict(item)),
+                                   options=None, track_options=None))
         else:
             self.start("Loading details...", lambda: self.api.detail(item),
                        lambda value: self.pages.append(dict(kind="detail", item=value, options=None, track_options=None)))
@@ -877,22 +1003,33 @@ class LibraryUI:
             self.screen, self.status, self.reporter = self.play_item(
                 self.config, self.api.token, self.api.user_id, item, prepared=prepared)
             self.renderer.screen = self.screen
-            if not (item.pop("_PlaybackCompleted", False) and item.get("Type") == "Episode"):
+            completed = item.pop("_PlaybackCompleted", False)
+            if self.offline:
+                # No server to report to: keep the position (or "watched") for later.
+                self.progress.record(item, (item.get("UserData") or {}).get("PlaybackPositionTicks", 0), completed)
+            if not (completed and item.get("Type") == "Episode"):
                 break
-            next_item = self.api.next_episode(item)
+            next_item = self.next_episode(item)
             if not next_item:
                 break
             self.status = "Playing next episode..."
             self.renderer.next_episode_splash(next_item)
             pygame.display.flip()
-            prepared = self.prepare_playback(
-                self.config, self.api.token, self.api.user_id, next_item)
+            prepared = self.prepare_video(next_item)
             item = next_item
         if self.pages and self.pages[-1].get("kind") == "detail":
             self.pages[-1]["item"] = item
         return item
 
-    def play_music(self, item, parent=None, tracks=None, title=None):
+    def shuffle_all(self, page):
+        """X on a music page: the whole album/playlist in random order."""
+        parent = page.get("parent")
+        if self.offline or page.get("offline_collection") or not parent:
+            self.play_music(random.choice(page["items"]), tracks=page["items"], title=page["title"], shuffle=True)
+        else:
+            self.play_music(page["items"][0], parent=parent, shuffle=True)
+
+    def play_music(self, item, parent=None, tracks=None, title=None, shuffle=False):
         """Queue the album/playlist parent (or given tracks) starting at item; just item otherwise."""
         def work():
             queue = self.api.album_tracks(parent) if parent else [t for t in tracks or [] if t.get("Type") == "Audio"]
@@ -900,6 +1037,14 @@ class LibraryUI:
             return (queue, ids.index(item["Id"])) if item.get("Id") in ids else ([item], 0)
         def ready(result):
             queue, start = result
+            if shuffle and queue:
+                # Start anywhere, then shuffle the rest around the playing track.
+                self.save_music_session()
+                self.music.play(queue, random.randrange(len(queue)), title or (parent or {}).get("Name"))
+                if self.music.queue and not self.music.queue.shuffle:
+                    self.music.toggle_shuffle()
+                self.open_player()
+                return
             key = tuple(track.get("Id") for track in queue)
             saved = next((s for s in self.my_sessions() if queue_key(s) == key), None)
             if saved and (session_queue(saved).current or {}).get("Id") == item.get("Id"):
@@ -929,34 +1074,254 @@ class LibraryUI:
             self.music.play(entry["tracks"], 0, entry["title"])
             self.open_player()
 
-    def download_page(self, page):
-        """R1 on a music page: download the album/playlist it shows."""
+    def download_target(self, page):
+        """What R1 downloads on this page: (id, title, parent, fetch items), or None.
+        Music lists download the album/playlist, a season's list its episodes, and a
+        film or episode details page that one video."""
+        if page["kind"] == "detail":
+            item = page["item"]
+            if item.get("Type") not in VIDEO_TYPES:
+                return None
+            title = item.get("Name") or "Video"
+            if item.get("Type") == "Episode":
+                title = "%s · S%sE%s %s" % (item.get("SeriesName") or "", item.get("ParentIndexNumber", "?"),
+                                            item.get("IndexNumber", "?"), title)
+            return item["Id"], title, item, lambda: [item if item.get("MediaSources") else self.api.detail(item)]
+        if page["kind"] != "list" or not page.get("parent"):
+            return None
         parent = page["parent"]
+        if any(item.get("Type") == "Audio" for item in page["items"]):
+            return parent["Id"], parent.get("Name") or page["title"], parent, lambda: self.api.album_tracks(parent)
+        if parent.get("Type") == "Season" and any(item.get("Type") == "Episode" for item in page["items"]):
+            title = " · ".join(v for v in (parent.get("SeriesName"), parent.get("Name") or page["title"]) if v)
+            # Every episode, with its media details (subtitles, size) for the download plan.
+            fetch = lambda: [self.api.detail(e) for e in self.api.children(parent, 0, limit=200)[0]
+                             if e.get("Type") == "Episode"]
+            return parent["Id"], title, parent, fetch
+        if parent.get("Type") == "Series":
+            # A show's season list: the whole show (which episodes is asked first).
+            return (parent["Id"], parent.get("Name") or page["title"], parent,
+                    lambda: self.api.series_episodes(parent["Id"]))
+        return None
+
+    def video_options(self, page):
+        """Download settings for videos: converted at the streaming quality unless Settings
+        says original; the audio track and an image subtitle picked in Play options."""
+        options = {"mode": self.config.get("videoDownloads", "converted"),
+                   "quality": self.config.get("quality", "480p").lower()}
+        chosen = page.get("track_options") if page["kind"] == "detail" else None
+        if chosen:
+            options["audio_index"] = chosen["audio"][chosen["audio_at"]]["index"]
+            subtitle = chosen["subtitles"][chosen["subtitle_at"]]["index"]
+            streams = ((page["item"].get("MediaSources") or [{}])[0].get("MediaStreams")
+                       or page["item"].get("MediaStreams") or [])
+            stream = next((s for s in streams if s.get("Index") == subtitle), {})
+            if subtitle is not None and not stream.get("IsTextSubtitleStream"):
+                options["subtitle_index"] = subtitle  # image subtitles can only be burned in
+        return options
+
+    def download_page(self, page):
+        """R1: download what this page shows (album, playlist, season, film, episode)."""
+        target = self.download_target(page)
+        if not target:
+            return
+        collection_id, title, parent, fetch = target
         if not self.config.get("downloadPath"):
             self.open_storage(then=lambda: self.download_page(page))
             return
         def notice(text):
-            page["notice"] = (text, time.monotonic() + 4)
-        state = self.downloads.status(parent["Id"])
-        if state and state["state"] == "done":
-            notice("Already downloaded · manage in Settings → Downloads")
+            page["notice"] = (text, time.monotonic() + 5)
+        def remove():
+            self.downloads.remove(collection_id)
+            notice("Download removed")
+        if parent.get("Type") == "Series" and page["kind"] == "list":
+            self.series_choices(page, parent, fetch, notice, remove)
             return
-        if state and state["state"] in ("downloading", "queued"):
-            notice("Already downloading")
+        state = self.downloads.status(collection_id)
+        if state:
+            # R1 again on something downloaded (or downloading): offer to remove it here.
+            self.ask("Remove this download?", [("Remove the downloaded files", remove), ("Keep it", None)])
             return
-        folder = self.config["downloadPath"]
-        def ready(tracks):
-            if not tracks:
-                notice("No tracks to download here")
+        if self.offline:
+            notice("Downloading needs the server")
+            return
+        self.fetch_and_download(page, collection_id, title, parent, fetch, notice)
+
+    def series_choices(self, page, series, fetch, notice, remove):
+        """R1 on a show: follow its next episodes, or download (unwatched / all) episodes."""
+        followed = series["Id"] in self.downloads.series
+        def follow():
+            if self.offline:
+                notice("Following a show needs the server")
                 return
-            self.downloads.add(parent["Id"], parent.get("Name") or page["title"], parent, tracks, folder)
-            notice("Downloading %d tracks to %s" % (len(tracks), folder))
-            # Cache the covers now (album card on Home, each track in Now Playing),
-            # using the same item data the offline screens draw from.
-            entry = self.downloads.collections[parent["Id"]]
-            for item in [entry["parent"]] + entry["tracks"] if self.artwork else []:
-                self.artwork.get(item, (188, 113), True)
-        self.start("Preparing download...", lambda: self.api.album_tracks(parent), ready)
+            self.downloads.follow_series(series, NEXT_EPISODES)
+            notice("Keeping the next %d unwatched episodes downloaded" % NEXT_EPISODES)
+            self.refresh_followed()
+        def unfollow():
+            self.downloads.unfollow_series(series["Id"])
+            notice("Stopped keeping the next episodes")
+        options = [("Stop keeping the next episodes", unfollow) if followed else
+                   ("Keep the next %d episodes downloaded" % NEXT_EPISODES, follow)]
+        if not self.offline:
+            title = series.get("Name") or page["title"]
+            options.append(("Download episodes...", lambda: self.fetch_and_download(
+                page, series["Id"], title, series, fetch, notice)))
+        if self.downloads.status(series["Id"]):
+            options.append(("Remove downloaded episodes", remove))
+        options.append(("Cancel", None))
+        self.ask(series.get("Name") or "This show", options)
+
+    def fetch_and_download(self, page, collection_id, title, parent, fetch, notice):
+        folder = self.config["downloadPath"]
+        options = self.video_options(page)
+        def ready(items):
+            if not items:
+                notice("Nothing to download here")
+                return
+            episodes = [i for i in items if i.get("Type") == "Episode"]
+            unwatched = [i for i in episodes if not (i.get("UserData") or {}).get("Played")]
+            if len(episodes) > 1 and len(unwatched) < len(episodes):
+                # Some are already watched: ask whether to skip them.
+                choices = [("All %d episodes" % len(episodes), lambda: start(items)), ("Cancel", None)]
+                if unwatched:
+                    choices.insert(0, ("Only the %d unwatched" % len(unwatched), lambda: start(unwatched)))
+                self.ask("%d of %d episodes already watched" % (len(episodes) - len(unwatched), len(episodes)),
+                         choices)
+                return
+            start(items)
+        def start(items):
+            # Video is big: refuse up front rather than fill the card halfway.
+            needed = sum(video_plan(i, options)["_size"] for i in items if i.get("Type") in VIDEO_TYPES)
+            free = free_bytes(folder)
+            if needed and needed > free - SPACE_MARGIN:
+                notice("Needs about %s, only %s free in %s" % (size_label(needed), size_label(free), folder))
+                return
+            self.downloads.add(collection_id, title, parent, items, folder, options)
+            noun = "tracks" if items[0].get("Type") == "Audio" else ("episodes" if len(items) > 1 else "video")
+            notice("Downloading %s to %s" % ("%d %s" % (len(items), noun) if len(items) > 1 else noun, folder)
+                   + (" (about %s)" % size_label(needed) if needed else ""))
+            # Cache the covers now (Home card, Now Playing, episode lists), using the
+            # same item data the offline screens draw from.
+            self.cache_covers(collection_id)
+        self.start("Preparing download...", fetch, ready)
+
+    def cache_covers(self, collection_id):
+        """Fetch covers now (Home card, Now Playing, episode lists) using the same item
+        data the offline screens draw from, so they show without a server later."""
+        entry = self.downloads.collections.get(collection_id)
+        for item in [entry["parent"]] + entry["tracks"] if entry and self.artwork else []:
+            self.artwork.get(item, (188, 113), True)
+
+    def refresh_followed(self):
+        """For each followed show, download its next unwatched episodes and delete the
+        watched ones. Runs when online: after login (once offline plays have synced)
+        and after watching something."""
+        if self.offline or not self.downloads or not self.downloads.series or not self.config.get("downloadPath"):
+            return
+        api, followed = self.api, dict(self.downloads.series)
+        options = {"mode": self.config.get("videoDownloads", "converted"),
+                   "quality": self.config.get("quality", "480p").lower()}
+        def work():
+            return {series_id: next_episodes(api.series_episodes(series_id), info["count"])
+                    for series_id, info in followed.items()}
+        def done(result, error):
+            if error or not self.downloads:
+                return
+            for series_id, items in result.items():
+                info = followed[series_id]
+                collection_id = "series-" + series_id
+                self.downloads.set_items(collection_id, info["name"] + " · next episodes", info["parent"],
+                                         items, self.config["downloadPath"], options)
+                self.cache_covers(collection_id)
+        self.jobs.submit(work, done)
+
+    def open_download(self, collection_id):
+        """Open something downloaded: music plays, a film opens its details, a season
+        its episode list. Works offline: everything comes from the downloads index."""
+        entry = self.downloads.collections.get(collection_id)
+        if not entry or not entry["tracks"]:
+            return
+        items = entry["tracks"]
+        if items[0].get("Type") == "Audio":
+            self.play_download(collection_id)
+        elif len(items) == 1:
+            self.pages.append(dict(kind="detail", item=self.with_offline_position(dict(items[0])),
+                                   options=None, track_options=None))
+        else:
+            self.pages.append(dict(kind="list", title=entry["title"], parent=entry["parent"],
+                                   items=[self.with_offline_position(dict(i)) for i in items], total=len(items),
+                                   more=False, next_start=len(items), selection=0, portrait=False,
+                                   paging=False, offline_collection=collection_id))
+
+    def with_offline_position(self, item):
+        """Show and resume from where an offline viewing stopped, until it syncs."""
+        ticks = self.progress.position(item["Id"]) if self.progress else None
+        if ticks is not None:
+            item.setdefault("UserData", {})["PlaybackPositionTicks"] = ticks
+        return item
+
+    def prepare_video(self, item, audio_index=None, subtitle_index=None):
+        """mpv arguments for item: its downloaded copy when there is one (even online)."""
+        local = self.downloads.local_path(item["Id"]) if self.downloads else None
+        if local:
+            self.with_offline_position(item)
+        return self.prepare_playback(self.config, self.api.token, self.api.user_id, item,
+                                     audio_index, subtitle_index, local_path=local)
+
+    def next_episode(self, item):
+        """Next episode: from a downloaded season when it's on the card (or offline),
+        otherwise from the server. A network error just ends the chain."""
+        for entry in self.downloads.collections.values() if self.downloads else []:
+            ids = [t["Id"] for t in entry["tracks"]]
+            if item["Id"] in ids and ids.index(item["Id"]) + 1 < len(ids):
+                candidate = entry["tracks"][ids.index(item["Id"]) + 1]
+                if self.offline or self.downloads.local_path(candidate["Id"]):
+                    return self.with_offline_position(dict(candidate))
+        if self.offline:
+            return None
+        try:
+            return self.api.next_episode(item)
+        except Exception as exc:
+            LOG.warning("Next episode lookup failed (%s)", type(exc).__name__)
+            return None
+
+    def sync_progress(self):
+        """Send what was watched or listened to offline (positions, finished plays)."""
+        pending = self.progress.pending() if self.progress else []
+        if self.offline:
+            return
+        if not pending:
+            self.refresh_followed()
+            return
+        api = self.api
+        def work():
+            synced = []
+            for entry in pending:
+                item = dict(entry["item"])
+                try:
+                    if entry["played"]:
+                        api.set_played(item, True)
+                    else:
+                        session = str(uuid.uuid4())
+                        api.report_playing("started", item, session, entry["ticks"])
+                        api.report_playing("stopped", item, session, entry["ticks"])
+                    synced.append(entry["id"])
+                except Exception as exc:
+                    LOG.warning("Offline progress sync failed (%s)", type(exc).__name__)
+            return synced
+        def done(synced, error):
+            for item_id in synced or []:
+                self.progress.done(item_id)
+            if synced:
+                message = "Synced %d offline plays with Jellyfin" % len(synced)
+                # Home may still be loading; its completion would wipe the status line.
+                if self.pending:
+                    self.status_after_load = message
+                else:
+                    self.status = message
+            # Followed shows see the synced watched marks before choosing their next episodes.
+            self.refresh_followed()
+        self.jobs.submit(work, done)
 
     def open_downloads(self):
         self.pages.append(dict(kind="downloads", selection=0, confirm=None))
@@ -1040,28 +1405,36 @@ class LibraryUI:
         self.enter_folder(page, path)  # open it, ready for "Use this folder"
 
     def download_label(self, page):
-        """For a page of tracks: where its offline copy stands (None: not a music page)."""
-        if not self.downloads or not any(item.get("Type") == "Audio" for item in page["items"]):
+        """Where this page's offline copy stands (None: nothing to download here)."""
+        target = self.download_target(page) if self.downloads else None
+        if not target:
             return None
         notice, until = page.get("notice") or ("", 0)
         if time.monotonic() < until:
             return notice
-        state = self.downloads.status(page["parent"].get("Id"))
+        if target[2].get("Type") == "Series" and target[0] in self.downloads.series:
+            following = self.downloads.status("series-" + target[0])
+            ready = " · %d on the card" % following["done"] if following else ""
+            return "Keeping the next %d episodes downloaded%s" % (NEXT_EPISODES, ready)
+        state = self.downloads.status(target[0])
         if not state:
             return ""
-        return {"done": "✓ Downloaded · %d tracks" % state["total"],
+        kinds = {i.get("Type") for i in page["items"]} if page["kind"] == "list" else set()
+        noun = "tracks" if "Audio" in kinds else ("episodes" if "Episode" in kinds else "videos")
+        return {"done": "✓ Downloaded" + (" · %d %s" % (state["total"], noun) if state["total"] > 1 else ""),
                 "downloading": "Downloading %d/%d" % (state["done"] + 1, state["total"]),
                 "queued": "Download queued",
                 "paused": state["error"],
                 "failed": "Download failed · retry in Settings → Downloads",
-                "incomplete": "Partly downloaded · %d/%d" % (state["done"], state["total"])}[state["state"]]
+                "incomplete": "Partly downloaded · %d/%d" % (state["done"], state["total"]),
+                "missing": "%d files missing from the card · Y in Settings → Downloads" % state["missing"]}[state["state"]]
 
     def downloads_activate(self, page):
         entries = self.downloads.listing()
         if page["selection"] == 0:
             self.open_storage()
         elif page["selection"] - 1 < len(entries):
-            self.play_download(entries[page["selection"] - 1]["id"])
+            self.open_download(entries[page["selection"] - 1]["id"])
 
     def downloads_button(self, page, button):
         """X removes (pressed twice), Y retries or resumes."""
@@ -1130,6 +1503,37 @@ class LibraryUI:
     def open_sessions(self):
         self.pages.append(dict(kind="sessions", selection=0, confirm=None))
 
+    def track_playable(self, track):
+        """Online everything can stream; offline only what's on the card."""
+        return not self.offline or bool(self.downloads and self.downloads.local_path(track["Id"]))
+
+    def resume_saved(self, session):
+        """A on a saved queue. Offline, one with nothing on the device needs the server."""
+        if self.offline and not any(self.downloads.has_file(t.get("Id")) for t in session.get("tracks", [])):
+            self.status = "Not downloaded: this queue needs the server"
+            return
+        self.resume_session(session)
+
+    def download_session(self, session):
+        """Y on a saved queue: download its tracks, e.g. an audiobook started by streaming."""
+        if self.offline:
+            self.status = "Downloading needs the server"
+            return
+        if not self.config.get("downloadPath"):
+            self.open_storage(then=lambda: self.download_session(session))
+            return
+        tracks = [dict(t, Type=t.get("Type") or "Audio") for t in session.get("tracks", [])]
+        if not tracks:
+            return
+        key = hashlib.sha256("\n".join(queue_key(session)).encode()).hexdigest()[:12]
+        title = session.get("title") or tracks[0].get("Album") or "Queue"
+        # The album cover stands for the queue on the Home row.
+        cover = {"Id": tracks[0].get("AlbumId") or tracks[0]["Id"], "Name": title, "Type": "MusicAlbum"}
+        if tracks[0].get("AlbumPrimaryImageTag"):
+            cover["ImageTags"] = {"Primary": tracks[0]["AlbumPrimaryImageTag"]}
+        self.downloads.add("queue-" + key, title, cover, tracks, self.config["downloadPath"])
+        self.status = "Downloading %d tracks of %s" % (len(tracks), title)
+
     def toggle_sessions(self):
         """R2: Saved queues from anywhere (not while typing); R2 again closes them."""
         if not self.api or not self.music or self.pending:
@@ -1171,7 +1575,7 @@ class LibraryUI:
         if not self.music.active:
             # Like a phone: play on the headset picks up the most recent queue.
             if action in ("play", "playpause") and self.my_sessions():
-                self.resume_session(self.my_sessions()[0])
+                self.resume_saved(self.my_sessions()[0])
             return
         if (action == "playpause" or (action == "play" and self.music.paused)
                 or (action == "pause" and not self.music.paused)):
@@ -1202,14 +1606,14 @@ class LibraryUI:
             page["view"] = "now"
             return True
         if page.get("options"):
-            return button in (5, 6, 7)
+            return button == 6 or button in self.y_buttons
         if button == 6:
             if page["view"] == "now":
                 page["view"], page["selection"] = "queue", self.music.queue.position
             else:
                 self.music.cycle_repeat()
             return True
-        if button in (5, 7):
+        if button in self.y_buttons:
             self.music.toggle_shuffle()
             page["selection"] = self.music.queue.position
             return True
@@ -1272,7 +1676,7 @@ class LibraryUI:
         if button == 9 and page["kind"] == "input":
             self.finish_input(page)
             return True
-        if button in (5, 7):  # Y: KNULLI exposes this as either index by input profile.
+        if button in self.y_buttons:  # Y (see Y_BUTTONS)
             if page["focus"] == "keys":
                 page["query"] = page["query"][:-1]
             return True
@@ -1285,8 +1689,16 @@ class LibraryUI:
             return True
         return False
 
+    def ask(self, title, options):
+        """Show a question; options are (label, callback). B or a None callback cancels."""
+        self.choice = {"title": title, "options": options, "row": 0}
+
     def move(self, x, y, repeat=False):
         if self.pending:
+            return
+        if self.choice:
+            if y:
+                self.choice["row"] = max(0, min(len(self.choice["options"]) - 1, self.choice["row"] - y))
             return
         if not self.api and self.setup_page and not self.pages:
             if y: self.setup_page["selection"] = max(0, min(4, self.setup_page["selection"] - y))
@@ -1346,7 +1758,7 @@ class LibraryUI:
                 page["key_x"] = min(page["key_x"], len(rows[page["key_y"]]) - 1)
             return
         if page["kind"] == "settings":
-            if y: page["selection"] = max(0, min(7, page["selection"] - y))
+            if y: page["selection"] = max(0, min(8, page["selection"] - y))
             return
         if page["kind"] == "detail" and page.get("options"):
             options = page["options"]
@@ -1358,13 +1770,23 @@ class LibraryUI:
             return
         if page["kind"] != "list":
             return
-        columns = 4 if page["portrait"] else 3
-        page["selection"] = max(0, min(len(page["items"]) - 1, page["selection"] + x - y * columns))
+        if page.get("tracklist"):
+            # One track per row; left/right jump a screen at a time.
+            step = 9 * x - y
+        else:
+            step = x - y * (4 if page["portrait"] else 3)
+        page["selection"] = max(0, min(len(page["items"]) - 1, page["selection"] + step))
         if len(page["items"]) - page["selection"] <= 8:
             self.more(page)
 
     def activate(self):
         if self.pending:
+            return
+        if self.choice:
+            _, callback = self.choice["options"][self.choice["row"]]
+            self.choice = None
+            if callback:
+                callback()
             return
         if not self.api and self.setup_page and not self.pages:
             self.setup_activate(); return
@@ -1373,7 +1795,7 @@ class LibraryUI:
         if self.pages and self.pages[-1]["kind"] == "sessions":
             sessions = self.my_sessions()
             if sessions:
-                self.resume_session(sessions[self.pages[-1]["selection"]])
+                self.resume_saved(sessions[self.pages[-1]["selection"]])
             return
         if self.pages and self.pages[-1]["kind"] == "downloads":
             self.downloads_activate(self.pages[-1])
@@ -1447,23 +1869,28 @@ class LibraryUI:
                 return
             if item.get("Type") == "Audio":
                 self.play_music(item); return
+            if self.offline and not self.downloads.local_path(item["Id"]):
+                self.status = "Not downloaded: playing it needs the server"
+                return
             if self.music.active:
                 # Video takes the display and audio device; music cannot continue under it.
                 self.music.stop()
             def ready(prepared):
                 self.play_chain(item, prepared)
                 self.renderer.screen = self.screen
+                self.refresh_followed()  # a watched episode makes room for the next one
                 self.return_home_refresh = True
                 self.direction = (0, 0)
                 pygame.event.clear()
-            self.start("Preparing video...", lambda: self.prepare_playback(
-                self.config, self.api.token, self.api.user_id, item, audio_index, subtitle_index), ready)
+            self.start("Preparing video...", lambda: self.prepare_video(item, audio_index, subtitle_index), ready)
 
     def back(self):
         if self.pending:
             self.jobs.cancel(self.pending)
             self.pending = None
             self.loading = ""
+        elif self.choice:
+            self.choice = None
         elif self.pages and self.pages[-1].get("confirm_logout"):
             self.pages[-1]["confirm_logout"] = False
         elif self.pages and self.pages[-1].get("options"):
@@ -1512,7 +1939,10 @@ class LibraryUI:
             self.renderer.player(self.pages[-1], self.music, self.artwork, self.status)
         elif self.pages[-1]["kind"] == "sessions":
             playing = queue_key(self.music.session()) if self.music.active and self.music.queue else None
-            self.renderer.sessions(self.pages[-1], self.my_sessions(), playing, self.status)
+            sessions = self.my_sessions()
+            local = [(sum(1 for t in s.get("tracks", []) if self.downloads.has_file(t.get("Id"))), len(s.get("tracks", [])))
+                     for s in sessions] if self.downloads else []
+            self.renderer.sessions(self.pages[-1], sessions, playing, self.status, local, self.offline)
         elif self.pages[-1]["kind"] == "downloads":
             location = self.config.get("downloadPath")
             self.renderer.downloads(self.pages[-1], self.downloads.listing(), location,
@@ -1524,12 +1954,20 @@ class LibraryUI:
         elif self.pages[-1]["kind"] == "list":
             page = self.pages[-1]
             page["download"] = self.download_label(page)
+            page["tracklist"] = any(item.get("Type") == "Audio" for item in page["items"])
+            if page["tracklist"]:
+                page["on_card"] = {i["Id"] for i in page["items"] if self.downloads and self.downloads.has_file(i.get("Id"))}
+                page["playing"] = (playing or {}).get("Id")
             self.renderer.listing(page, self.artwork, bool(self.pending))
             if page["paging"]:
                 self.renderer.spinner(606, 418, 7)
         else:
             page = self.pages[-1]
-            self.renderer.detail(page["item"], self.artwork, self.status, page.get("options"))
+            page["download"] = self.download_label(page)
+            self.renderer.detail(page["item"], self.artwork, self.status or page["download"] or "",
+                                 page.get("options"), page["download"] is not None)
+        if self.choice and not self.pending:
+            self.renderer.choice(self.choice)
         if self.pending:
             self.renderer.loading(self.loading)
             self.renderer.footer("Loading...     B  Cancel     Start  Exit")
@@ -1543,7 +1981,10 @@ class LibraryUI:
             if self.artwork:
                 self.artwork.jobs.poll()
             if self.reporter and self.reporter.finished.is_set():
-                self.status = "Progress saved" if self.reporter.stop_ok else "Could not save progress to Jellyfin"
+                if self.offline:
+                    self.status = "Progress saved on the device; it syncs when you're back online"
+                else:
+                    self.status = "Progress saved" if self.reporter.stop_ok else "Could not save progress to Jellyfin"
                 self.reporter = None
             if self.music:
                 was_active = self.music.active
@@ -1577,11 +2018,18 @@ class LibraryUI:
                     self.move(*self.direction)
                     self.repeat_at = time.monotonic() + 0.35
                 elif event.type == pygame.JOYBUTTONDOWN:
+                    if self.choice and event.button not in (3, 4, 9, 10, 11):
+                        continue  # a question is open: only A, B (and exit) apply
                     if self.pages and self.pages[-1]["kind"] in ("search", "input") and self.keyboard_button(event.button):
                         continue
                     if self.pages and self.pages[-1]["kind"] == "player" and self.player_button(event.button):
                         continue
-                    if self.pages and self.pages[-1]["kind"] == "downloads" and event.button in (5, 6, 7):
+                    if self.pages and self.pages[-1]["kind"] == "sessions" and event.button in self.y_buttons:
+                        sessions = self.my_sessions()
+                        if sessions:
+                            self.download_session(sessions[self.pages[-1]["selection"]])
+                        continue
+                    if self.pages and self.pages[-1]["kind"] == "downloads" and (event.button == 6 or event.button in self.y_buttons):
                         self.downloads_button(self.pages[-1], 6 if event.button == 6 else 5)
                         continue
                     if event.button == R2_BUTTON:
@@ -1610,11 +2058,13 @@ class LibraryUI:
                             if self.status.startswith("Could not load more"):
                                 self.status = ""
                                 self.more(page)
+                            elif page.get("tracklist") and page["items"]:
+                                self.shuffle_all(page)  # X on music: Shuffle all
                             elif page["items"]:
                                 self.toggle_played(page["items"][page["selection"]])
                         else:
                             self.refresh()
-                    elif event.button in (5, 7):
+                    elif event.button in self.y_buttons:
                         if self.pages and self.pages[-1]["kind"] == "detail":
                             self.toggle_played(self.pages[-1]["item"])
                         else:

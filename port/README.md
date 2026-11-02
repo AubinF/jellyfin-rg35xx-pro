@@ -25,8 +25,9 @@ Credentials are encrypted on the device using a device-local key. Never share th
 - Music: **A** pauses; D-pad left/right seeks; up/down changes track; **X** shows the queue (there **X** cycles repeat); **Y** shuffles; **R1** opens Music options (favourite, sleep timer, saved queues, screen off); **B** returns to the library while music keeps playing.
 - Headset (wired or Bluetooth): play/pause, next and previous control the music from any screen, even with the screen off. Single-button remotes: 1 press play/pause, 2 next, 3 previous.
 - **R2** opens Saved queues from anywhere. Home: **B** returns to Now Playing, or opens Saved queues: up to 10 queues (e.g. audiobooks) each keep their track and position. **A** resumes, **X** twice removes.
-- Downloads: **R1** on an album, playlist or audiobook page downloads it; choose the location the first time (second SD card, internal, or browse to / create any folder). Manage in Settings → Downloads.
+- Downloads: **R1** downloads an album, playlist, audiobook, film (details page) or season (episode list); videos are converted to your quality setting unless Settings → Video downloads says original; choose the location the first time (second SD card, internal, or browse to / create any folder). Manage in Settings → Downloads.
 - Offline: without a server the app opens with your Downloads (and Saved queues); **X** tries to go online again.
+- Albums are a track list: **A** plays, **X** shuffles all. **R1** on a show keeps its next 3 episodes downloaded; **R1** again on anything downloaded removes it.
 - The screen turns off while music plays without input (Settings → Music screen off); any button wakes it.
 - Volume buttons remain controlled by KNULLI.
 

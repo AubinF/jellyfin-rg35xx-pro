@@ -2,6 +2,7 @@
 import io, json, logging, math, os, subprocess, tempfile, time, uuid
 import pygame
 import requests
+from downloads import VIDEO_PROFILES
 from playback import ControllerInput, PlaybackReporter, PlaybackSession
 
 BUILD = "2.1.3"
@@ -167,15 +168,14 @@ def report_playing(config, token, user_id, item, session_id, position_ticks=0, e
         LOG.info("Playback %s HTTP %d position_ticks=%d", event, response.status_code, int(position_ticks))
         response.raise_for_status()
 
-def prepare_playback(config, token, user_id, item, audio_index=None, subtitle_index=None):
+def prepare_playback(config, token, user_id, item, audio_index=None, subtitle_index=None, local_path=None):
     item_id = item.get("Id")
     if not item_id: raise ValueError("Missing media ID")
     session_id = str(uuid.uuid4())
     resume_ticks = item.get("UserData", {}).get("PlaybackPositionTicks", 0)
     resume_seconds = resume_ticks / 10000000.0
     quality = config.get("quality", "480p").lower()
-    profiles = {"360p": (640, 360, 900000, 1200000), "480p": (854, 480, 1400000, 1800000), "720p": (1280, 720, 2800000, 3400000), "1080p": (1920, 1080, 5000000, 6000000)}
-    width, height, video_bitrate, max_bitrate = profiles.get(quality, profiles["480p"])
+    width, height, video_bitrate, max_bitrate = VIDEO_PROFILES.get(quality, VIDEO_PROFILES["480p"])
     url = config["serverUrl"].rstrip("/") + "/Videos/" + item_id + "/stream?static=true&ApiKey=" + token
     play_method = "DirectPlay"
     media_source_id = item.get("MediaSourceId")
@@ -183,8 +183,11 @@ def prepare_playback(config, token, user_id, item, audio_index=None, subtitle_in
     if is_audio:
         # mpv decodes music directly; no video transcoding profile is needed.
         url = config["serverUrl"].rstrip("/") + "/Audio/" + item_id + "/stream?static=true&ApiKey=" + token
+    if local_path:
+        # A downloaded copy: no server needed. Subtitles saved next to it load by name.
+        url = local_path
     try:
-        if is_audio: raise StopIteration
+        if is_audio or local_path: raise StopIteration
         profile = {"Name": "RG35XX H", "MaxStreamingBitrate": max_bitrate, "MaxStaticBitrate": max_bitrate,
                    "SupportedMediaTypes": "Video", "DirectPlayProfiles": [],
                    "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac", "Protocol": "hls", "Context": "Streaming", "MaxAudioChannels": "2", "MinSegments": 1, "SegmentLength": 3}],

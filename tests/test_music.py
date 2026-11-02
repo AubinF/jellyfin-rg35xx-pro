@@ -287,6 +287,42 @@ class MusicPlayerTests(unittest.TestCase):
         self.assertTrue(self.run_until(lambda: self.player.started and self.player.position()[0] >= 19))
         self.assertEqual(self.player.current["Id"], "long")
 
+    def test_offline_passes_over_tracks_not_on_the_device(self):
+        self.player.playable = lambda track: track["Id"] != "1"
+        self.player.play([{"Id": "0"}, {"Id": "1"}, {"Id": "2"}])
+        self.assertTrue(self.run_until(lambda: not self.player.active))
+        time.sleep(0.2)
+        with self.lock:
+            self.assertEqual([t for e, t in self.reports if e == "started"], ["0", "2"])
+
+    def test_nothing_on_the_device_stops_but_keeps_the_queue(self):
+        self.player.playable = lambda track: False
+        self.player.play([{"Id": "0"}, {"Id": "1"}])
+        self.assertFalse(self.player.active)
+        self.assertEqual(self.player.status, "Nothing left in this queue is on the device")
+        self.assertEqual(queue_key(self.player.last_session), ("0", "1"))
+
+    def test_crashed_player_restarts_at_the_same_track_and_position(self):
+        long_tone = Path(self.directory.name) / "long2.wav"
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=duration=30",
+                        str(long_tone)], check=True)
+        self.files["long2"] = str(long_tone)
+        self.player.play([{"Id": "0"}, {"Id": "long2"}], start=1)
+        self.assertTrue(self.run_until(lambda: self.player.started))
+        self.player.seek(12)
+        self.assertTrue(self.run_until(lambda: self.player.position()[0] >= 11))
+        crashed = self.player.player
+        crashed.kill()
+        crashed.wait()
+        self.assertTrue(self.run_until(lambda: self.player.player is not crashed and self.player.started
+                                       and self.player.position()[0] >= 9))
+        self.assertEqual(self.player.current["Id"], "long2")
+        self.assertEqual(self.player.status, "Music player restarted after a crash")
+        # A second crash right away stops instead of looping.
+        self.player.player.kill()
+        self.assertTrue(self.run_until(lambda: not self.player.active))
+        self.assertEqual(self.player.status, "Music stopped unexpectedly")
+
     def test_missing_file_is_skipped(self):
         self.files["bad"] = str(Path(self.directory.name) / "missing.wav")
         self.player.play([{"Id": "bad", "Name": "Broken"}, {"Id": "0"}])

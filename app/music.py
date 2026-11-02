@@ -161,8 +161,12 @@ class MusicPlayer:
     mpv; skips replace the playlist. Each track gets its own Jellyfin play
     session so the server sees ordinary per-track playback reports.
     """
-    def __init__(self, stream_url, report, token, guard=True):
+    def __init__(self, stream_url, report, token, guard=True, playable=None, log_path=None):
         self.stream_url, self.report, self.token, self.guard = stream_url, report, token, guard
+        self.log_path = log_path
+        self.recovered_at = -60.0  # last crash recovery (monotonic time)
+        # Offline, only downloaded tracks can play: the rest are passed over, not tried.
+        self.playable = playable or (lambda track: True)
         self.queue = None
         self.player = self.ipc = self.reporter = None
         self.status = ""
@@ -251,8 +255,15 @@ class MusicPlayer:
             args = [sys.executable, os.path.abspath(playback.__file__), "--guard-parent",
                     str(os.getpid())] + args
         self.ipc = MpvIPC(path)
+        try:
+            # Keep mpv's own messages: they explain an unexpected exit.
+            errors = open(self.log_path, "wb") if self.log_path else subprocess.DEVNULL
+        except OSError:
+            errors = subprocess.DEVNULL
         self.player = subprocess.Popen(args, start_new_session=True, stdin=subprocess.DEVNULL,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                       stdout=errors, stderr=errors)
+        if errors is not subprocess.DEVNULL:
+            errors.close()  # the child keeps its own copy of the file descriptor
         self.connect_deadline = time.monotonic() + 8
         LOG.info("Music player started pid=%d", self.player.pid)
 
@@ -261,6 +272,15 @@ class MusicPlayer:
         self.reporter = None
         self.started = False
         self.queued = False
+        for _ in range(len(self.queue.order)):
+            if self.playable(self.current):
+                break
+            if not self.queue.advance(1):
+                break  # at the end: stays on the last track
+        if not self.playable(self.current):
+            self.stop()  # keep the saved queue: it plays again once online
+            self.status = "Nothing left in this queue is on the device"
+            return
         # Ignore end-file events until mpv confirms this file started: an eof
         # for the previous track can still be in flight when we skip.
         self.awaiting_start = True
@@ -273,8 +293,10 @@ class MusicPlayer:
         playlist-clear drops everything except the playing file."""
         self.ipc.command("playlist-clear")
         upcoming = self.queue.peek()
-        self.queued = upcoming is not None
-        if upcoming:
+        # An unplayable next track isn't lined up; at the end of this one the queue
+        # moves on through _load, which passes over it.
+        self.queued = upcoming is not None and self.playable(upcoming)
+        if self.queued:
             self.ipc.command("loadfile", self.stream_url(upcoming), "append")
 
     def _finish_track(self, ticks=None):
@@ -291,9 +313,8 @@ class MusicPlayer:
         if not self.active:
             return
         if self.player.poll() is not None:
-            LOG.warning("Music player exited unexpectedly")
-            self.stop()
-            self.status = "Music stopped unexpectedly"
+            LOG.warning("Music player exited unexpectedly (exit code %s)", self.player.returncode)
+            self._recover()
             return
         if not self.ipc.sock:
             if not self.ipc.connect():
@@ -303,8 +324,8 @@ class MusicPlayer:
                 return
         self.ipc.poll()
         if self.ipc.eof:
-            self.stop()
-            self.status = "Music stopped unexpectedly"
+            LOG.warning("Music player connection closed unexpectedly")
+            self._recover()
             return
         if self.started:
             self.last_ticks = self.ipc.position_ticks(self.last_ticks)
@@ -354,6 +375,8 @@ class MusicPlayer:
                     # mpv is already starting the lined-up track; just follow it.
                     self.queue.advance(1, automatic=True)
                     self.queued = False
+                elif self.queue.peek() is not None and self.queue.advance(1, automatic=True):
+                    self._load()  # the next track wasn't lined up (not on the device)
                 else:
                     self.stop(keep_session=False)
                     self.status = "Finished playing the queue"
@@ -369,6 +392,22 @@ class MusicPlayer:
                 else:
                     # Replace mpv's own move to the lined-up file to keep one code path.
                     self._load()
+
+    def _recover(self):
+        """mpv died mid-queue: start it again at the same track and position, once per
+        30 s, so a crash costs a second of music instead of the whole listening session.
+        mpv's own messages are in the log file passed to the player (log_path)."""
+        session = self.session()
+        sleep, sleep_at = self.sleep, self.sleep_at
+        self.stop()
+        if session and time.monotonic() - self.recovered_at > 30:
+            self.recovered_at = time.monotonic()
+            self.resume(session)
+            self.sleep, self.sleep_at = sleep, sleep_at  # a running sleep timer keeps going
+            self.status = "Music player restarted after a crash"
+            LOG.info("Music player restarted at track %d", self.queue.position + 1 if self.queue else 0)
+        else:
+            self.status = "Music stopped unexpectedly"
 
     def _sleep_now(self):
         self.stop()

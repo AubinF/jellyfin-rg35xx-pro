@@ -77,11 +77,23 @@ class LibraryAPI:
                         MediaTypes="Video", Fields=FIELDS,
                         EnableImageTypes="Primary,Thumb,Backdrop").get("Items", [])
 
-    def latest(self, parent):
+    def latest(self, parent, kinds="Movie,Episode"):
         result = self.get("/Users/" + self.user_id + "/Items/Latest", ParentId=parent,
-                          Limit=24, IncludeItemTypes="Movie,Episode", Fields=FIELDS,
+                          Limit=24, IncludeItemTypes=kinds, Fields=FIELDS,
                           EnableImageTypes="Primary,Thumb,Backdrop")
         return result if isinstance(result, list) else result.get("Items", [])
+
+    def recently_played(self):
+        """Tracks played most recently first (A on one queues its album from there)."""
+        return self.get("/Users/" + self.user_id + "/Items", Recursive="true", IncludeItemTypes="Audio",
+                        Filters="IsPlayed", SortBy="DatePlayed", SortOrder="Descending", Limit=24,
+                        Fields=FIELDS, EnableImageTypes="Primary,Thumb,Backdrop").get("Items", [])
+
+    def series_episodes(self, series_id):
+        """Every episode of a series in watching order, with media details for downloads."""
+        return self.get("/Shows/" + series_id + "/Episodes", UserId=self.user_id,
+                        Fields=FIELDS + ",MediaSources,SeriesId,SeasonId,IndexNumber,ParentIndexNumber",
+                        EnableImageTypes="Primary,Thumb,Backdrop").get("Items", [])
 
     def children(self, item, start=0, limit=30):
         kind = item.get("Type")

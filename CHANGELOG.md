@@ -17,10 +17,21 @@
 - Downloads for offline listening: **R1** on an album, playlist or audiobook page downloads its original files in the background (resumable, pauses when the card is full). Choose the location (second SD card, internal storage, or any folder through a folder browser that can also create one) in Settings → Downloads, where downloads can also be played, retried or removed. Downloaded tracks play from the card, and a Downloads row appears on Home.
 - Offline mode: when the server can't be reached at startup, Home shows the Downloads row (with covers cached at download time); downloads and saved queues play from the card, unfinished downloads wait, and **X** reconnects without interrupting the music.
 - **R2** opens Saved queues from anywhere.
+- Film and series downloads: **R1** on a film's details page or a season's episode list. Videos are converted by the server to the Quality setting (or kept original via Settings → Video downloads), with text subtitles saved as files and image subtitles burned in when picked in Play options; the expected size is checked against free space. Downloaded videos play from the card (online too), and downloaded seasons open offline as episode lists that continue to the next episode.
+- Offline progress: positions and finished plays (videos and music) are kept on the device without a server and sent to Jellyfin when the app is next online.
+- Albums and playlists are shown as a track list with ✓ for tracks on the card; **X** shuffles the whole album.
+- Home rows for music libraries: Latest albums and Recently Played (a track plays its album from there).
+- Shows: **R1** keeps the next 3 unwatched episodes downloaded (watched ones are swapped for the next when online), or downloads all/unwatched episodes; seasons ask whether to skip watched episodes.
+- **R1** on something downloaded offers to remove it; files deleted by hand show as missing instead of downloading again on their own.
+- Battery level and clock in the header (the version moved to Settings).
+- The music player restarts at the same track and position if mpv crashes (mpv's messages go to `mpv-music.log`).
+- Saved queues show how much of each queue is on the device; offline, queues with nothing downloaded are greyed out, partly downloaded ones skip the missing tracks, and **Y** downloads a saved queue.
 
 ### Fixed
 
 - The release package now includes `music.py` and `downloads.py`.
+- On the RG35XX Pro, L1 no longer acts as Y.
+- Changing Quality in Settings applies to new downloads right away.
 
 ## [2.1.3] - 2026-09-08
 

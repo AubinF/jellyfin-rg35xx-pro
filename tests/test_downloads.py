@@ -19,10 +19,25 @@ class FakeJellyfin(BaseHTTPRequestHandler):
     """/Items/<id>/Download with Range support; ids in `broken` answer 500."""
     broken = set()
     requests = []
+    queries = []
 
     def do_GET(self):
-        item = self.path.split("/")[2]
+        path, _, query = self.path.partition("?")
+        item = path.split("/")[2]
         FakeJellyfin.requests.append((item, self.headers.get("Range"), self.headers.get("X-Emby-Token")))
+        FakeJellyfin.queries.append((path, dict(pair.split("=", 1) for pair in query.split("&") if pair)))
+        if "/Subtitles/" in path:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"1\n00:00:01,000 --> 00:00:02,000\nHello\n")
+            return
+        if path.endswith("/stream.ts"):
+            # A server conversion: no Content-Length, the body ends when encoding does.
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.end_headers()
+            self.wfile.write(FILES[item])
+            return
         if item in self.broken or item not in FILES:
             self.send_response(500)
             self.end_headers()
@@ -57,7 +72,7 @@ class DownloadsTests(unittest.TestCase):
         self.root = tempfile.TemporaryDirectory()
         self.index = os.path.join(self.root.name, "index.json")
         self.card = os.path.join(self.root.name, "card", "Jellyfin")
-        FakeJellyfin.broken, FakeJellyfin.requests = set(), []
+        FakeJellyfin.broken, FakeJellyfin.requests, FakeJellyfin.queries = set(), [], []
         self.managers = []
         # /tmp is RAM on some machines; treat the test folder as a real card.
         real = patch.object(downloads, "on_real_storage", return_value=True)
@@ -170,6 +185,97 @@ class DownloadsTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.card))
         manager.retry("alb")
         self.assertTrue(self.wait(manager, "alb", "done"))
+
+
+    def film(self, item_id="t1"):
+        return {"Id": item_id, "Type": "Movie", "Name": "Dune: Part Two", "RunTimeTicks": 60 * 10000000,
+                "MediaSources": [{"Id": "src-" + item_id, "Size": 9 * 1024 ** 3, "MediaStreams": [
+                    {"Type": "Video", "Index": 0}, {"Type": "Audio", "Index": 1},
+                    {"Type": "Subtitle", "Index": 2, "Language": "eng", "Codec": "subrip", "IsTextSubtitleStream": True},
+                    {"Type": "Subtitle", "Index": 3, "Language": "fre", "Codec": "PGSSUB", "IsTextSubtitleStream": False}]}]}
+
+    def test_converted_film_with_text_subtitles(self):
+        manager = self.manager()
+        options = {"mode": "converted", "quality": "480p", "audio_index": 1, "subtitle_index": 3}
+        manager.add("film", "Dune: Part Two", self.film(), [self.film()], self.card, options)
+        self.assertTrue(self.wait(manager, "film", "done"))
+        path = manager.local_path("t1")
+        self.assertTrue(path.endswith(".ts"))
+        self.assertEqual(Path(path).read_bytes(), FILES["t1"])
+        stream = next(q for p, q in FakeJellyfin.queries if p.endswith("/stream.ts"))
+        self.assertEqual((stream["VideoCodec"], stream["MaxWidth"], stream["AudioStreamIndex"],
+                          stream["SubtitleStreamIndex"], stream["SubtitleMethod"], stream["MediaSourceId"]),
+                         ("h264", "854", "1", "3", "Encode", "src-t1"))
+        # Only the text subtitle is saved, named so mpv loads it with the video.
+        subs = manager.files["t1"]["subs"]
+        self.assertEqual([Path(s).name for s in subs], [Path(path).stem + ".eng.srt"])
+        self.assertIn(b"Hello", Path(subs[0]).read_bytes())
+        manager.remove("film")
+        self.assertFalse(os.path.exists(path) or os.path.exists(subs[0]))
+
+    def test_original_film_uses_the_resumable_download(self):
+        manager = self.manager()
+        manager.add("film", "Film", self.film(), [self.film()], self.card, {"mode": "original"})
+        self.assertTrue(self.wait(manager, "film", "done"))
+        self.assertTrue(any(p.endswith("/t1/Download") for p, _ in FakeJellyfin.queries))
+        self.assertTrue(manager.local_path("t1").endswith(".flac"))  # the server's own file name
+
+    def test_video_plan_estimates_size_and_picks_text_subtitles(self):
+        film = self.film()
+        converted = downloads.video_plan(film, {"mode": "converted", "quality": "480p"})
+        # (1.4 Mb/s video + 128 kb/s audio) for 60 s, plus 10%.
+        self.assertEqual(converted["_size"], int((1400000 + 128000) / 8 * 60 * 1.1))
+        self.assertEqual([s["index"] for s in converted["_subs"]], [2])
+        self.assertEqual(downloads.video_plan(film, {"mode": "original"})["_size"], 9 * 1024 ** 3)
+
+    def test_offline_progress_survives_a_restart_until_synced(self):
+        path = os.path.join(self.root.name, "progress.json")
+        progress = downloads.OfflineProgress(path)
+        progress.record({"Id": "ep1", "Name": "Pilot", "Type": "Episode"}, 12345, False)
+        progress.record({"Id": "ep2", "Type": "Episode"}, 999, True)
+        again = downloads.OfflineProgress(path)
+        self.assertEqual((again.position("ep1"), again.position("ep2")), (12345, 0))
+        again.done("ep1")
+        self.assertEqual([e["id"] for e in downloads.OfflineProgress(path).pending()], ["ep2"])
+
+
+    def test_files_deleted_by_hand_are_not_downloaded_again_until_asked(self):
+        manager = self.manager()
+        manager.add("alb", "Alb", {"Id": "alb"}, self.tracks("t1", "t3"), self.card)
+        self.assertTrue(self.wait(manager, "alb", "done"))
+        os.remove(manager.local_path("t1"))
+        manager.close()
+        restarted = self.manager()
+        time.sleep(0.3)
+        status = restarted.status("alb")
+        self.assertEqual((status["state"], status["missing"]), ("missing", 1))
+        self.assertEqual(sum(1 for item, _, _ in FakeJellyfin.requests if item == "t1"), 1)  # not fetched again
+        restarted.retry("alb")  # Y: get it back on purpose
+        self.assertTrue(self.wait(restarted, "alb", "done"))
+
+    def test_set_items_swaps_watched_episodes_for_the_next_ones(self):
+        manager = self.manager()
+        episodes = [dict(t, Type="Episode") for t in self.tracks("t1", "t2", "t3")]
+        manager.set_items("series-x", "Show · next", {"Id": "x"}, episodes[:2], self.card, {"mode": "original"})
+        self.assertTrue(self.wait(manager, "series-x", "done"))
+        first = manager.local_path("t1")
+        manager.set_items("series-x", "Show · next", {"Id": "x"}, episodes[1:], self.card)
+        self.assertTrue(self.wait(manager, "series-x", "done"))
+        self.assertFalse(os.path.exists(first))           # watched one deleted
+        self.assertTrue(manager.local_path("t2") and manager.local_path("t3"))
+        self.assertEqual(sum(1 for item, _, _ in FakeJellyfin.requests if item == "t2"), 1)  # kept, not refetched
+
+    def test_next_episodes_start_at_the_first_unwatched(self):
+        episodes = [{"Id": str(i), "UserData": {"Played": i < 2}} for i in range(6)]
+        self.assertEqual([e["Id"] for e in downloads.next_episodes(episodes, 3)], ["2", "3", "4"])
+        self.assertEqual(downloads.next_episodes([{"Id": "a", "UserData": {"Played": True}}], 3), [])
+
+    def test_followed_series_are_remembered(self):
+        manager = self.manager()
+        manager.follow_series({"Id": "x", "Name": "Show", "Type": "Series"}, 3)
+        self.assertEqual(self.manager().series["x"]["count"], 3)
+        manager.unfollow_series("x")
+        self.assertNotIn("x", self.manager().series)
 
 
 class StorageTests(unittest.TestCase):
