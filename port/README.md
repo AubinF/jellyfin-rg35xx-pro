@@ -28,6 +28,7 @@ Credentials are encrypted on the device using a device-local key. Never share th
 - Downloads: **R1** downloads an album, playlist, audiobook, film (details page) or season (episode list); videos are converted to your quality setting unless Settings → Video downloads says original; choose the location the first time (second SD card, internal, or browse to / create any folder). Manage in Settings → Downloads.
 - Offline: without a server the app opens with your Downloads (and Saved queues); **X** tries to go online again.
 - Albums are a track list: **A** plays, **X** shuffles all. **R1** on a show keeps its next 3 episodes downloaded; **R1** again on anything downloaded removes it.
+- Books: **A** on a book reads it (EPUB, CBZ, CBR, PDF). Reading: **A** next page, **Y** previous, **R1** menu; EPUB **X** text size, **B** close; comics/PDF **X** zoom in, **B** zoom out (twice at whole page to close), D-pad pans. Continue reading on Home.
 - The screen turns off while music plays without input (Settings → Music screen off); any button wakes it.
 - Volume buttons remain controlled by KNULLI.
 

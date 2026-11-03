@@ -12,6 +12,8 @@ import uuid
 
 import pygame
 
+from books import BookError, ReadingProgress, cached_book, detect, fetch_book, open_pages, parse_epub
+from reader import ROTATION_NAMES, SIZE_NAMES, ZOOM_NAMES, ZOOMS, ImageReader, TextReader
 from downloads import (SPACE_MARGIN, VIDEO_TYPES, Downloads, OfflineProgress, free_bytes, next_episodes,
                        on_real_storage, safe_name, storage_choices, video_plan)
 from library import Artwork, Jobs, LibraryAPI, OfflineLibrary, Rows
@@ -29,6 +31,9 @@ MEDIA_KEYS = {getattr(pygame, name) for name in ("K_AUDIOPLAY", "K_AUDIOSTOP", "
                                                  "K_AUDIOPAUSE", "K_MEDIASELECT", "K_UNKNOWN") if hasattr(pygame, name)}
 LOG = logging.getLogger("jellyfin.ui")
 DATA_DIR = os.path.dirname(os.environ.get("JELLYFIN_CONFIG", "/userdata/roms/ports/jellyfinrg35xx/config.json"))
+# Books opened without being downloaded are kept here (they're small); comics
+# unpacked from CBR and rendered PDF pages live in a folder per book next to them.
+BOOK_CACHE = os.path.join(DATA_DIR, "cache", "books")
 
 BG = (16, 16, 20)
 PANEL = (28, 29, 36)
@@ -432,6 +437,22 @@ class Renderer:
             self.text("Open an album, playlist or audiobook and press R1", 18, 250, 604, self.font, MUTED, center=True)
         self.footer("▲ ▼  Choose     A  Play / Change     X  Remove     Y  Retry     B  Back")
 
+    def toc(self, page, toc, current):
+        """A book's chapter list; the chapter you are in is marked."""
+        self.header(False)
+        self.text("Chapters", 18, 79, 300, self.heading)
+        rows = 10
+        first = max(0, min(page["selection"] - rows // 2, len(toc) - rows))
+        for offset, (title, chapter) in enumerate(toc[first:first + rows]):
+            index, y = first + offset, 114 + offset * 31
+            selected = index == page["selection"]
+            if selected:
+                pygame.draw.rect(self.screen, ACCENT, (18, y, 604, 28), border_radius=4)
+            here = chapter == current
+            self.text(("▶ " if here else "") + title, 30, y + 4, 580, self.font,
+                      TEXT if selected else (ACCENT if here else TEXT))
+        self.footer("▲ ▼  Choose     A  Go to chapter     B  Back to the book")
+
     def choice(self, choice):
         """A small question over the current screen (e.g. which episodes to download)."""
         options = choice["options"]
@@ -492,7 +513,7 @@ class Renderer:
             self.text(status, 18, 418, 604, self.small, MUTED)
         self.footer("▲ ▼  Choose     A  Open / Use     B  Back")
 
-    def detail(self, item, artwork, status, options=None, downloadable=False):
+    def detail(self, item, artwork, status, options=None, downloadable=False, read_percent=None):
         self.header(False)
         self.card(item, pygame.Rect(18, 110, 144, 240), artwork, False, False, False)
         self.wrap(item.get("SeriesName") or item.get("Name", "Untitled"), 185, 82, 434, 2, self.heading, TEXT)
@@ -505,13 +526,17 @@ class Renderer:
         self.wrap(item.get("Overview") or "No description available.", 185, 195, 432, 7)
         ticks = (item.get("UserData") or {}).get("PlaybackPositionTicks", 0)
         label = "Resume %d:%02d" % (ticks // 600000000, (ticks // 10000000) % 60) if ticks > 30000000 else "Play"
-        if item.get("Type") in ("Movie", "Episode", "Video", "MusicVideo", "Audio"):
+        if item.get("Type") == "Book":
+            label = "Continue %d%%" % (read_percent * 100) if read_percent else "Read"
+        if item.get("Type") in ("Movie", "Episode", "Video", "MusicVideo", "Audio", "Book"):
             pygame.draw.rect(self.screen, ACCENT, (185, 362, 212, 39), border_radius=5)
             self.text("A   " + label, 195, 371, 192, self.font, TEXT, center=True)
         else:
             self.text("This media type is not playable yet", 185, 370, 429, self.small, MUTED)
         self.text(status, 18, 414, 600, self.small, ACCENT if status.startswith(("✓", "Downloading")) else MUTED)
-        if downloadable:
+        if item.get("Type") == "Book":
+            self.footer("A  Read     R1  Download     Y  Mark read     B  Back     Start  Exit")
+        elif downloadable:
             self.footer("A  Play / Resume    X  Play options    Y  Watched    R1  Download    B  Back")
         else:
             self.footer("A  Play / Resume     X  Play options     Y  Watched     B  Back     Start  Exit")
@@ -690,6 +715,7 @@ class LibraryUI:
         self.music = None
         self.downloads = None
         self.progress = None  # plays recorded offline, synced when back online
+        self.reading = None   # where each book was left (books.ReadingProgress)
         self.status_after_load = ""  # a message to show once the current loading finishes
         self.choice = None  # an open question (see ask()); it takes the D-pad, A and B
         self.session_path = os.path.join(DATA_DIR, "music-queue.json")
@@ -833,6 +859,7 @@ class LibraryUI:
         (e.g. coming back online) keeps them, so playing music is not interrupted."""
         index = self.downloads_index(user)
         self.progress = OfflineProgress(index.replace("downloads-", "offline-progress-"))
+        self.reading = ReadingProgress(index.replace("downloads-", "reading-"))
         if self.downloads and self.downloads.index_path == index:
             if self.offline:
                 self.downloads.set_offline(True)
@@ -876,8 +903,11 @@ class LibraryUI:
         self.open_account(user, None)
         self.pages = [p for p in self.pages if p["kind"] in ("player", "sessions", "downloads")]
         downloaded = [dict(entry["parent"], _download=entry["id"]) for entry in self.downloads.listing()]
-        self.rows = Rows([{"title": "Downloads", "items": downloaded, "loaded": True,
-                           "empty": "Nothing downloaded yet: X to try the server again"}])
+        rows = [{"title": "Downloads", "items": downloaded, "loaded": True,
+                 "empty": "Nothing downloaded yet: X to try the server again"}]
+        if self.reading.recent():
+            rows.insert(0, self.reading_row())
+        self.rows = Rows(rows)
         self.status = "Offline: showing your downloads"
         LOG.info("Offline mode: %d downloads", len(downloaded))
         return True
@@ -897,6 +927,8 @@ class LibraryUI:
             downloaded = [dict(entry["parent"], _download=entry["id"]) for entry in self.downloads.listing()]
             if downloaded:
                 values.insert(1, {"title": "Downloads", "items": downloaded, "loaded": True})
+            if self.reading and self.reading.recent():
+                values.insert(1, self.reading_row())
             if any(view.get("CollectionType") == "music" for view in views):
                 # A recent track plays its album from there, not just this row of tracks.
                 values.append({"title": "Recently Played", "fetch": self.api.recently_played,
@@ -908,6 +940,9 @@ class LibraryUI:
                     # Music libraries hold albums, which the films/episodes row never showed.
                     values.append({"title": "Latest albums in " + view.get("Name", "Music"),
                                    "fetch": lambda parent=view["Id"]: self.api.latest(parent, "MusicAlbum")})
+                elif view.get("CollectionType") == "books":
+                    values.append({"title": "Recently Added in " + view.get("Name", "Books"),
+                                   "fetch": lambda parent=view["Id"]: self.api.latest(parent, "Book")})
                 else:
                     values.append({"title": "Recently Added in " + view.get("Name", "Library"),
                                    "fetch": lambda parent=view["Id"]: self.api.latest(parent)})
@@ -956,6 +991,9 @@ class LibraryUI:
             return
         if item.get("_download"):
             self.open_download(item["_download"])
+            return
+        if item.get("_read"):
+            self.open_book(item)  # Continue reading: straight back into the book
             return
         kind = item.get("Type", "")
         if library or item.get("IsFolder") or kind in ("Series", "Season", "Folder", "CollectionFolder", "UserView", "BoxSet"):
@@ -1057,6 +1095,116 @@ class LibraryUI:
             self.open_player()
         self.start("Preparing music...", work, ready)
 
+    # ---- books ---------------------------------------------------------------------
+    def reading_row(self):
+        return {"title": "Continue reading", "loaded": True,
+                "items": [dict(book, _read=True) for book in self.reading.recent()]}
+
+    def open_book(self, item):
+        """Open a book from the card (downloaded or cached) or fetch it first. Parsing
+        and unpacking happen in the background; the reader is built once that's done."""
+        local = (self.downloads and self.downloads.local_path(item["Id"])) or cached_book(BOOK_CACHE, item["Id"])
+        if not local and self.offline:
+            self.status = "Not downloaded: reading it needs the server"
+            return
+        api = self.api
+        def work():
+            try:
+                path = local or fetch_book(api.server, api.headers, self.verify, item, BOOK_CACHE)
+                kind = detect(path)
+                if kind == "epub":
+                    return kind, parse_epub(path)
+                return kind, open_pages(path, kind, os.path.join(BOOK_CACHE, item["Id"]))
+            except BookError as exc:
+                return "error", str(exc)  # a message for the screen, not just an error name
+        self.start("Opening %s..." % (item.get("Name") or "book"), work, lambda result: self.show_book(item, *result))
+
+    def show_book(self, item, kind, data):
+        if kind == "error":
+            self.status = data
+            return
+        saved = self.reading.get(item["Id"]) or {}
+        position = None if saved.get("finished") else saved.get("position")
+        if kind == "epub":
+            font = os.path.join(os.path.dirname(__file__), "assets", "DejaVuSans.ttf")
+            reader = TextReader(data, font, position, self.config.get("readerSize", 1),
+                                self.config.get("readerTheme", "dark"))
+        else:
+            # Saved as the zoom itself (e.g. 1.75), so adding levels never shifts it.
+            level = self.config.get("comicZoomLevel", "width" if self.config.get("comicFit") == "width" else "page")
+            zoom = ZOOMS.index(level) if level in ZOOMS else 0
+            reader = ImageReader(data, position, zoom, self.config.get("comicRotation", 0))
+        self.pages.append(dict(kind="reader", reader=reader, item=item, finished=bool(saved.get("finished"))))
+        self.save_reading(self.pages[-1], force=True)  # appears in Continue reading right away
+
+    def save_reading(self, page, force=False):
+        reader, item = page["reader"], page["item"]
+        finished = reader.at_end()
+        self.reading.update(item, reader.position(), reader.percent(), finished, force)
+        if finished and not page["finished"]:
+            page["finished"] = True
+            self.mark_book_read(item)
+
+    def mark_book_read(self, item):
+        """Reaching the last page marks the book read in Jellyfin (or later, offline)."""
+        if self.offline:
+            self.progress.record(item, 0, True)
+            return
+        api = self.api
+        self.jobs.submit(lambda: api.set_played(dict(item), True), lambda value, error: None)
+
+    def close_book(self):
+        page = self.pages.pop()
+        self.save_reading(page, force=True)
+        reader = page["reader"]
+        # Keep the reader's choices for the next book.
+        if reader.kind == "text":
+            self.config.update(readerSize=reader.size, readerTheme=reader.theme)
+        else:
+            self.config.update(comicZoomLevel=ZOOMS[reader.zoom], comicRotation=reader.rotation)
+        self.save_config(self.config)
+
+    def reader_menu(self, page):
+        reader = page["reader"]
+        def refresh():
+            self.save_reading(page)
+        options = []
+        if reader.kind == "text":
+            options += [("Chapters...", lambda: self.pages.append(dict(kind="toc", selection=next(
+                            (i for i, (_, chapter) in reversed(list(enumerate(reader.book["toc"])))
+                             if chapter <= reader.chapter), 0)))),
+                        ("Text size: %s" % SIZE_NAMES[reader.size], lambda: (reader.cycle_size(), refresh())),
+                        ("Theme: %s" % reader.theme.title(), reader.toggle_theme)]
+        else:
+            options += [("Zoom: %s..." % ZOOM_NAMES[reader.zoom], lambda: self.ask("Zoom", [
+                            (name, lambda level=level: reader.set_zoom(level)) for level, name in enumerate(ZOOM_NAMES)])),
+                        ("Rotate: %s..." % ROTATION_NAMES[reader.rotation], lambda: self.ask(
+                            "Rotate the page (hold the handheld upright)",
+                            [(name, lambda turn=turn: reader.rotate(turn)) for turn, name in ROTATION_NAMES.items()]))]
+        options += [("Go to the start", lambda: (reader.jump(0), refresh())),
+                    ("Close the book", self.close_book), ("Cancel", None)]
+        self.ask(page["item"].get("Name") or "Book", options)
+
+    def reader_button(self, button):
+        """Buttons while reading, the same for books and comics where possible:
+        A next page, Y (and L1 where it isn't Y) previous, X bigger text / zoom in,
+        R1 the menu. B (close; zoom out on comics) goes through back()."""
+        page = self.pages[-1]
+        reader = page["reader"]
+        if button == 3:
+            reader.next()
+        elif button in self.y_buttons or (button == 7 and 7 not in self.y_buttons):
+            reader.previous()
+        elif button == 6:
+            reader.cycle_size() if reader.kind == "text" else reader.zoom_in()
+        elif button == 8:
+            self.reader_menu(page)
+            return True
+        else:
+            return False
+        self.save_reading(page)
+        return True
+
     def track_url(self, track):
         """Downloaded tracks always play from the card, even when online."""
         return (self.downloads and self.downloads.local_path(track["Id"])) or self.api.stream_url(track)
@@ -1080,6 +1228,8 @@ class LibraryUI:
         film or episode details page that one video."""
         if page["kind"] == "detail":
             item = page["item"]
+            if item.get("Type") == "Book":
+                return item["Id"], item.get("Name") or "Book", item, lambda: [item]
             if item.get("Type") not in VIDEO_TYPES:
                 return None
             title = item.get("Name") or "Video"
@@ -1707,6 +1857,15 @@ class LibraryUI:
             self.rows.move(x, y)
             return
         page = self.pages[-1]
+        if page["kind"] == "reader":
+            page["reader"].move(x, y)
+            self.save_reading(page)
+            return
+        if page["kind"] == "toc":
+            toc = self.pages[-2]["reader"].book["toc"]
+            if y:
+                page["selection"] = max(0, min(len(toc) - 1, page["selection"] - y))
+            return
         if page["kind"] == "sessions":
             if y:
                 page["selection"] = max(0, min(len(self.my_sessions()) - 1, page["selection"] - y))
@@ -1792,6 +1951,17 @@ class LibraryUI:
             self.setup_activate(); return
         if self.pages and self.pages[-1]["kind"] == "settings":
             self.settings_activate(); return
+        if self.pages and self.pages[-1]["kind"] == "reader":
+            # A turns the page (keyboard Enter too); the menu is on R1.
+            self.pages[-1]["reader"].next()
+            self.save_reading(self.pages[-1])
+            return
+        if self.pages and self.pages[-1]["kind"] == "toc":
+            selection = self.pages.pop()["selection"]
+            page = self.pages[-1]
+            page["reader"].jump(page["reader"].book["toc"][selection][1])
+            self.save_reading(page)
+            return
         if self.pages and self.pages[-1]["kind"] == "sessions":
             sessions = self.my_sessions()
             if sessions:
@@ -1850,6 +2020,9 @@ class LibraryUI:
         else:
             page = self.pages[-1]
             item = page["item"]
+            if item.get("Type") == "Book":
+                self.open_book(item)
+                return
             if item.get("Type") not in ("Movie", "Episode", "Video", "MusicVideo", "Audio"):
                 return
             options = page.get("options") or page.get("track_options")
@@ -1891,6 +2064,11 @@ class LibraryUI:
             self.loading = ""
         elif self.choice:
             self.choice = None
+        elif self.pages and self.pages[-1]["kind"] == "reader":
+            reader = self.pages[-1]["reader"]
+            # Comics: B zooms out, and at the whole page needs a second press to close.
+            if reader.kind == "text" or reader.back():
+                self.close_book()
         elif self.pages and self.pages[-1].get("confirm_logout"):
             self.pages[-1]["confirm_logout"] = False
         elif self.pages and self.pages[-1].get("options"):
@@ -1937,6 +2115,11 @@ class LibraryUI:
             self.renderer.settings(self.pages[-1])
         elif self.pages[-1]["kind"] == "player":
             self.renderer.player(self.pages[-1], self.music, self.artwork, self.status)
+        elif self.pages[-1]["kind"] == "reader":
+            self.pages[-1]["reader"].draw(self.screen, self.renderer)  # full screen, its own status bar
+        elif self.pages[-1]["kind"] == "toc":
+            reader = self.pages[-2]["reader"]
+            self.renderer.toc(self.pages[-1], reader.book["toc"], reader.chapter)
         elif self.pages[-1]["kind"] == "sessions":
             playing = queue_key(self.music.session()) if self.music.active and self.music.queue else None
             sessions = self.my_sessions()
@@ -1964,8 +2147,10 @@ class LibraryUI:
         else:
             page = self.pages[-1]
             page["download"] = self.download_label(page)
+            read = self.reading.get(page["item"]["Id"]) if self.reading else None
             self.renderer.detail(page["item"], self.artwork, self.status or page["download"] or "",
-                                 page.get("options"), page["download"] is not None)
+                                 page.get("options"), page["download"] is not None,
+                                 read["percent"] if read and not read.get("finished") else None)
         if self.choice and not self.pending:
             self.renderer.choice(self.choice)
         if self.pending:
@@ -2020,6 +2205,9 @@ class LibraryUI:
                 elif event.type == pygame.JOYBUTTONDOWN:
                     if self.choice and event.button not in (3, 4, 9, 10, 11):
                         continue  # a question is open: only A, B (and exit) apply
+                    if (not self.choice and self.pages and self.pages[-1]["kind"] == "reader"
+                            and self.reader_button(event.button)):  # an open menu keeps A for itself
+                        continue
                     if self.pages and self.pages[-1]["kind"] in ("search", "input") and self.keyboard_button(event.button):
                         continue
                     if self.pages and self.pages[-1]["kind"] == "player" and self.player_button(event.button):
@@ -2100,7 +2288,8 @@ class LibraryUI:
                 self.repeat_at = time.monotonic() + 0.15
             timeout = (self.config or {}).get("screenOff", 30)
             if (not self.dark and timeout and self.music and self.music.active and not self.music.paused
-                    and not self.pending and time.monotonic() - self.last_input > timeout):
+                    and not self.pending and time.monotonic() - self.last_input > timeout
+                    and not (self.pages and self.pages[-1]["kind"] in ("reader", "toc"))):  # reading: keep it on
                 self.go_dark()
             if self.dark:
                 # Nothing to draw; a slow loop still feeds mpv IPC and the sleep timer.

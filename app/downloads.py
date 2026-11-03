@@ -21,7 +21,7 @@ from music import SAVED_FIELDS
 LOG = logging.getLogger("jellyfin.downloads")
 FOLDER_NAME = "Jellyfin"
 VIDEO_TYPES = ("Movie", "Episode", "Video", "MusicVideo")
-DOWNLOADABLE = ("Audio",) + VIDEO_TYPES
+DOWNLOADABLE = ("Audio", "Book") + VIDEO_TYPES
 # Streaming profiles shared with playback: quality -> (width, height, video bitrate, max bitrate).
 VIDEO_PROFILES = {"360p": (640, 360, 900000, 1200000), "480p": (854, 480, 1400000, 1800000),
                   "720p": (1280, 720, 2800000, 3400000), "1080p": (1920, 1080, 5000000, 6000000)}
@@ -57,6 +57,9 @@ def slim(item, options):
         kept = {k: item[k] for k in VIDEO_FIELDS if k in item}
         kept.update(video_plan(item, options))
         return kept
+    if item.get("Type") == "Book":
+        return {k: item[k] for k in ("Id", "Name", "Type", "ImageTags", "Overview", "ProductionYear", "UserData")
+                if k in item}
     return {k: item[k] for k in SAVED_FIELDS + ("Container", "IndexNumber") if k in item}
 # Never fill a card to the brim: the system and saves need room too.
 SPACE_MARGIN = 200 * 1024 * 1024

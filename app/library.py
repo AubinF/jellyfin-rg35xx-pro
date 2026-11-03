@@ -152,7 +152,7 @@ class LibraryAPI:
         """Search the signed-in user's library, optionally within one folder."""
         params = dict(UserId=self.user_id, SearchTerm=term, Recursive="true", Limit=30,
                       Fields=FIELDS, SortBy="SortName", SortOrder="Ascending",
-                      IncludeItemTypes="Movie,Series,Episode,Video,MusicVideo,Audio,MusicAlbum,MusicArtist,BoxSet,Folder",
+                      IncludeItemTypes="Movie,Series,Episode,Video,MusicVideo,Audio,MusicAlbum,MusicArtist,Book,BoxSet,Folder",
                       EnableImageTypes="Primary,Thumb,Backdrop")
         if parent:
             params["ParentId"] = parent["Id"]
